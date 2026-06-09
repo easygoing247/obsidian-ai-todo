@@ -23,12 +23,12 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "README.md",
+                "file": "ToDo_Inbox.md",
                 "mode": "source",
                 "source": false
               },
               "icon": "lucide-file",
-              "title": "README"
+              "title": "ToDo_Inbox"
             }
           }
         ],
@@ -198,12 +198,12 @@
   },
   "active": "aa87b9ac2e3f1059",
   "lastOpenFiles": [
+    "README.md",
     "ToDo_Inbox.md",
     "00_Daily_ToDo/2026-06-12.md",
     "01_FX_ScenarioMaking/26612【朝イチ】シナリオ構築.md",
     "00_Daily_ToDo/2026-06-11.md",
     "00_Daily_ToDo/2026-06-10.md",
-    "README.md",
     "01_FX_ScenarioMaking/260610【朝イチ】シナリオ構築.md",
     "01_FX_ScenarioMaking/【朝イチ】シナリオ構築ベース.md",
     "無題のファイル（タイトルはなんでもいいが、FX・other work・Everyday Lifeなどを付けて大まかに分けておくと人間的には分かりやすいと思う）.md",
