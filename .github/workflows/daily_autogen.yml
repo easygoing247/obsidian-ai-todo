@@ -1,0 +1,60 @@
+name: Daily ToDo Autogen (JST 05:00)
+
+# 毎朝5時（日本時間）に、その日の ToDo を Dropbox 上の Vault から直接生成し
+# GitHub へバックアップする「クラウド完結型」ジョブ。PC の電源が OFF でも動作する。
+#
+# JST 05:00 == UTC 20:00（前日）。GitHub Actions の cron は UTC 基準。
+on:
+  schedule:
+    - cron: "0 20 * * *"   # 毎日 UTC 20:00 = JST 翌 05:00
+  workflow_dispatch:        # 手動実行（テスト用）も可能にする
+
+# 生成物を push_to_github が REST API でコミットするためトークンを使う。
+# ワークフロー自体には特別な権限は不要（read でよい）。
+permissions:
+  contents: read
+
+concurrency:
+  group: daily-autogen
+  cancel-in-progress: false
+
+jobs:
+  autogen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      # ヘッドレス import 時にスケジューラスレッドを起動させないフラグ
+      HEADLESS_JOB: "1"
+      # --- Gemini ---
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      # --- GitHub（push_to_github が使用）---
+      GITHUB_TOKEN: ${{ secrets.GH_BACKUP_TOKEN }}
+      GITHUB_REPO: ${{ secrets.GH_BACKUP_REPO }}
+      GITHUB_BRANCH: ${{ secrets.GH_BACKUP_BRANCH }}
+      # --- Dropbox（OAuth2 自動リフレッシュ：期限切れを回避）---
+      DROPBOX_APP_KEY: ${{ secrets.DROPBOX_APP_KEY }}
+      DROPBOX_APP_SECRET: ${{ secrets.DROPBOX_APP_SECRET }}
+      DROPBOX_REFRESH_TOKEN: ${{ secrets.DROPBOX_REFRESH_TOKEN }}
+      # 短命トークンだけで運用する場合はこちら（任意）
+      DROPBOX_ACCESS_TOKEN: ${{ secrets.DROPBOX_ACCESS_TOKEN }}
+      # Dropbox 上の Vault ルート（例: /Apps/remotely-save/MyVault）
+      DROPBOX_VAULT_PATH: ${{ secrets.DROPBOX_VAULT_PATH }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run headless daily generation
+        run: |
+          python -c "from app import run_headless_generation; import json; print(json.dumps(run_headless_generation(), ensure_ascii=False, indent=2))"
