@@ -360,12 +360,50 @@ def prefilter_text_for_date(text: str, target_date: date) -> str:
     return "\n".join(out)
 
 
+def _strip_non_task_lines(text: str) -> str:
+    """タスク行（`- [ ]`）とその直下のインデント子行**以外**（見出し・地の文・空行等）を除去する。
+
+    【トークン最適化】Gemini はタスク抽出のみ行うため、本文の解説・見出し等の
+    プレーンテキストは判定に不要。日付事前フィルタ通過後のタスクブロック（親行＋子行）は
+    1文字も変更せず完全に保持するため、抽出精度・タスク消失防止セーフティネットには
+    一切影響しない（トークン量だけを削減する）。
+    """
+    lines = text.split("\n")
+    out = []
+    i, n = 0, len(lines)
+    while i < n:
+        line = lines[i]
+        if line.lstrip().startswith("- ["):
+            out.append(line)
+            i += 1
+            while i < n:
+                nxt = lines[i]
+                if nxt.strip() == "" or not (nxt.startswith(" ") or nxt.startswith("\t")):
+                    break
+                out.append(nxt)
+                i += 1
+            continue
+        i += 1  # タスク行でない行（見出し・地の文・空行）は送信対象から除外
+    return "\n".join(out)
+
+
 def build_filtered_context(notes, target_date: date) -> str:
-    """各ノートを対象日で事前フィルタしてから結合する。"""
+    """各ノートを対象日で事前フィルタし、タスク行以外を除去してから結合する。
+
+    【トークン最適化（1分あたりの入力トークン上限対策）】
+    1. `prefilter_text_for_date`: 対象日に関係ないタスク（過去/未来/繰り返し不一致）を
+       子行ごと物理的に除去する（既存ロジック・無改変）。
+    2. `_strip_non_task_lines`: 残った中からタスク行（親＋子）以外の見出し・地の文を除去。
+    3. 該当タスクが1件も無いファイルは `--- File: ... ---` ヘッダーごと完全にスキップし、
+       無駄なヘッダー分のトークンも節約する。
+    """
     chunks = []
     for n in notes:
         filtered = prefilter_text_for_date(n["text"], target_date)
-        chunks.append(f"--- File: {n['rel']} ---\n{filtered}")
+        task_only = _strip_non_task_lines(filtered)
+        if not task_only.strip():
+            continue  # 該当タスクが無いファイルはヘッダーごとスキップ
+        chunks.append(f"--- File: {n['rel']} ---\n{task_only}")
     return "\n\n".join(chunks)
 
 
@@ -755,7 +793,10 @@ def build_todo_prompt(target_date: date, weekday_jp: str, notes_context: str) ->
 
 # レートリミット時のリトライ設定
 RATE_LIMIT_MAX_RETRIES = 3   # 429 検知時に再試行する最大回数
-RATE_LIMIT_WAIT_SECONDS = 10  # 各再試行前に待機する秒数
+RATE_LIMIT_WAIT_SECONDS = 30  # retry_delay が取得できない場合のデフォルト待機秒数
+
+# Google API が 429 のエラーメッセージ内に埋め込む "retry_delay { seconds: NN }" を抽出
+_RETRY_DELAY_RE = re.compile(r"retry_delay\s*\{\s*seconds:\s*(\d+)")
 
 
 def _is_rate_limit_error(e: Exception) -> bool:
@@ -767,6 +808,28 @@ def _is_rate_limit_error(e: Exception) -> bool:
         kw in msg
         for kw in ("429", "quota", "resourceexhausted", "rate limit", "exceeded")
     )
+
+
+def _extract_retry_delay_seconds(e: Exception) -> int:
+    """429 エラーが指示する待機秒数（retry_delay）を抽出する。
+
+    Google API のエラーメッセージ／メタデータには
+    `retry_delay { seconds: NN }` が埋め込まれていることが多い。
+    取得できればその秒数（+1秒の安全マージン）を、できなければ
+    `RATE_LIMIT_WAIT_SECONDS`（既定30秒）を返す。
+    """
+    # 1) 例外オブジェクトの metadata / details から探す（google.api_core 系）
+    for attr in ("metadata", "details", "args"):
+        val = getattr(e, attr, None)
+        if val:
+            m = _RETRY_DELAY_RE.search(str(val))
+            if m:
+                return int(m.group(1)) + 1
+    # 2) 例外の文字列表現から探す
+    m = _RETRY_DELAY_RE.search(str(e))
+    if m:
+        return int(m.group(1)) + 1
+    return RATE_LIMIT_WAIT_SECONDS
 
 
 class _NoOpBox:
@@ -801,9 +864,11 @@ def _safe_status_box():
 def generate_todo(prompt: str) -> str:
     """Gemini を呼び出して ToDo 抽出結果のテキストを返す。
 
-    レートリミット（429 / Quota exceeded）を検知した場合は、画面に待機案内を
-    出しつつ 10 秒待って自動再試行する（最大 RATE_LIMIT_MAX_RETRIES 回）。
+    レートリミット（429 / Quota exceeded / ResourceExhausted）を検知した場合は、
+    エラーが指示する `retry_delay`（無ければ既定 `RATE_LIMIT_WAIT_SECONDS` 秒）だけ
+    待機して自動再試行する（最大 RATE_LIMIT_MAX_RETRIES 回）。
     成功時は案内を消し、リトライを使い切った場合は最後の例外を送出する。
+    GitHub Actions 等の非対話環境でも `_safe_status_box` により安全に動作する。
     """
     genai.configure(api_key=GEMINI_API_KEY)
     model = genai.GenerativeModel(model_name=MODEL_ID)
@@ -819,12 +884,17 @@ def generate_todo(prompt: str) -> str:
         except Exception as e:  # noqa: BLE001
             # レートリミットかつ再試行回数が残っている場合のみ待機して再挑戦
             if _is_rate_limit_error(e) and attempt < RATE_LIMIT_MAX_RETRIES:
+                wait_s = _extract_retry_delay_seconds(e)
                 warn_box.warning(
                     "⚠️ Google APIの制限に達しました。"
-                    f"{RATE_LIMIT_WAIT_SECONDS}秒間待機して自動で再試行します..."
+                    f"{wait_s}秒間待機して自動で再試行します..."
                     f"（再試行 {attempt + 1}/{RATE_LIMIT_MAX_RETRIES}）"
                 )
-                time.sleep(RATE_LIMIT_WAIT_SECONDS)
+                print(  # GitHub Actions のログにも残す
+                    f"[rate-limit] 429 検知。{wait_s}秒待機して再試行 "
+                    f"({attempt + 1}/{RATE_LIMIT_MAX_RETRIES})"
+                )
+                time.sleep(wait_s)
                 continue
             # レートリミット以外、または再試行を使い切った場合は送出
             warn_box.empty()
