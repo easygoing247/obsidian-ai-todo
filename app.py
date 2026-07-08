@@ -175,14 +175,25 @@ def _read_raw_notes_from_disk(notes_dir: str):
     return notes
 
 
+def read_notes_fresh(notes_dir: str):
+    """キャッシュを介さず最新のノートを取得する（Dropbox 認証時はクラウドから直接）。
+
+    強制再生成・朝5時ジョブなど「最新の Inbox を必ず反映したい」場面で使う。
+    """
+    if _dropbox_configured():
+        return get_vault_storage(notes_dir).load_notes()
+    return _read_raw_notes_from_disk(notes_dir)
+
+
 @st.cache_data(show_spinner=False)
 def load_raw_notes(notes_dir: str):
-    """`_read_raw_notes_from_disk` のキャッシュ版（通常の高速表示用）。
+    """ノート読み込みのキャッシュ版（通常の高速表示用）。
 
-    最新の Inbox を強制反映したい場合は `load_raw_notes.clear()` でキャッシュを破棄するか、
-    `_read_raw_notes_from_disk` を直接呼ぶ（キャッシュ強制バイパス）。
+    Dropbox 認証があればクラウドの Vault を、無ければローカルを読み込む。
+    最新を強制反映したい場合は `load_raw_notes.clear()` でキャッシュ破棄、
+    または `read_notes_fresh` を直接呼ぶ（キャッシュ強制バイパス）。
     """
-    return _read_raw_notes_from_disk(notes_dir)
+    return read_notes_fresh(notes_dir)
 
 
 @st.cache_data(show_spinner=False)
@@ -948,22 +959,17 @@ def generate_todos_for_dates(target_dates, notes):
 # キャッシュ / Inbox / 日次ファイル のローカル入出力
 # ---------------------------------------------------------------------------
 def load_cache() -> dict:
-    """ローカルの ToDo キャッシュ（{ 'YYYY-MM-DD': markdown }）を読み込む。"""
-    try:
-        with open(CACHE_PATH, encoding="utf-8") as f:
-            data = json.load(f)
-            return data if isinstance(data, dict) else {}
-    except (OSError, ValueError):
-        return {}
+    """ToDo キャッシュ（{ 'YYYY-MM-DD': markdown }）を読み込む。
+
+    Dropbox 認証があればクラウド上（`00_Daily_ToDo/todo_cache.json`）から、
+    無ければローカルの `todo_cache.json` から読み込む。
+    """
+    return get_vault_storage().read_cache()
 
 
 def save_cache(cache: dict) -> None:
-    """ToDo キャッシュを JSON で永続化する。"""
-    try:
-        with open(CACHE_PATH, "w", encoding="utf-8") as f:
-            json.dump(cache, f, ensure_ascii=False, indent=2)
-    except OSError:
-        pass
+    """ToDo キャッシュを永続化する（Dropbox 認証があればクラウド、無ければローカル）。"""
+    get_vault_storage().write_cache(cache)
 
 
 def _parse_banner_text(text: str) -> str:
@@ -983,12 +989,11 @@ def _parse_banner_text(text: str) -> str:
 
 
 def read_inbox_banner(vault_dir: str) -> str:
-    """ToDo_Inbox/ToDo_Inbox.md 先頭の YAML Frontmatter から banner の値を読む（無ければ既定値）。"""
-    try:
-        text = (Path(vault_dir) / INBOX_FILENAME).read_text(encoding="utf-8")
-    except OSError:
-        return DEFAULT_BANNER
-    return _parse_banner_text(text)
+    """ToDo_Inbox/ToDo_Inbox.md 先頭の YAML Frontmatter から banner の値を読む（無ければ既定値）。
+
+    Dropbox 認証があればクラウド上の Inbox から、無ければローカルから読み込む。
+    """
+    return get_vault_storage(vault_dir).banner()
 
 
 def build_daily_file_content(body: str, banner: str) -> str:
@@ -996,8 +1001,14 @@ def build_daily_file_content(body: str, banner: str) -> str:
     return f"---\nbanner: {banner}\n---\n\n{body.strip()}\n"
 
 
-def write_daily_file_local(vault_dir: str, date_str: str, content: str) -> Path:
-    """vault の 00_Daily_ToDo/ に YYYY-MM-DD.md をローカル作成（上書き）する。"""
+def write_daily_file_local(vault_dir: str, date_str: str, content: str):
+    """vault の 00_Daily_ToDo/ に YYYY-MM-DD.md を作成（上書き）する。
+
+    Dropbox 認証があればクラウド上へ直接書き込み（戻り値は相対パス文字列）、
+    無ければローカルへ書き込む（戻り値は Path）。
+    """
+    if _dropbox_configured():
+        return get_vault_storage(vault_dir).write_daily(date_str, content)
     folder = Path(vault_dir) / EXCLUDED_DIR_NAME
     folder.mkdir(parents=True, exist_ok=True)
     target = folder / f"{date_str}.md"
@@ -1036,6 +1047,10 @@ def copy_fx_scenario_template(vault_dir: str, target_date: date):
       "error:..."     → OS エラー
       それ以外（True, dest_path_str）→ 複製成功
     """
+    # Dropbox 認証があればクラウド経路（土日スキップ等の判定は同一ロジック）
+    if _dropbox_configured():
+        return get_vault_storage(vault_dir).copy_fx_scenario(target_date)
+
     # 土曜(5)・日曜(6) はスキップ
     if target_date.weekday() >= 5:
         return False, "weekend"
@@ -1075,6 +1090,10 @@ def archive_past_files(vault_dir: str, target_date: date) -> dict:
             "yearly_fx":      移動フォルダ数 | None,
         }
     """
+    # Dropbox 認証があればクラウド経路（move API でフォルダ整理）
+    if _dropbox_configured():
+        return get_vault_storage(vault_dir).archive(target_date)
+
     if target_date.day != 1:
         return {}
 
@@ -1178,6 +1197,14 @@ def cleanup_inbox_singles(vault_dir: str, saved_date_strs) -> int:
     - 期間指定タスク（`[date:: YYYY-MM-DD-YYYY-MM-DD]`）は終了日の保存まで削除されない
       （`_is_deletable_date_task` が終了日以降のみ True を返す設計による）。
     """
+    # Dropbox 認証があればクラウド上の Inbox を直接お掃除（.bak も Dropbox 上に作成）
+    if _dropbox_configured():
+        removed = get_vault_storage(vault_dir).cleanup_inbox(saved_date_strs)
+        if removed:
+            load_raw_notes.clear()
+            scan_md_files.clear()
+        return removed
+
     path = Path(vault_dir) / INBOX_FILENAME
     try:
         text = path.read_text(encoding="utf-8")
@@ -1257,30 +1284,27 @@ def _priority_rank(text: str) -> int:
     return _PRIORITY_RANK.get(val, 0)
 
 
-def extract_categories(vault_dir: str):
-    """ToDo_Inbox/ToDo_Inbox.md 全体から `[category:: ...]` の中身を重複なく抽出する（出現順）。"""
-    try:
-        text = (Path(vault_dir) / INBOX_FILENAME).read_text(encoding="utf-8")
-    except OSError:
-        return []
+def _parse_categories_text(text: str):
+    """Inbox 本文から `[category:: ...]` の中身を重複なく抽出する（出現順）。純粋関数。"""
     seen = []
-    for raw in _CATEGORY_RE.findall(text):
+    for raw in _CATEGORY_RE.findall(text or ""):
         v = raw.strip()
         if v and v not in seen:
             seen.append(v)
     return seen
 
 
-def append_task_to_inbox(vault_dir: str, title: str, date_val, category: str, priority: str) -> bool:
-    """新構文に準拠した ToDo 行を `## 単発` セクション内に日付昇順で挿入する。
+def extract_categories(vault_dir: str):
+    """ToDo_Inbox/ToDo_Inbox.md 全体から `[category:: ...]` を抽出（Dropbox 認証時はクラウド）。"""
+    return get_vault_storage(vault_dir).extract_categories()
 
-    - `## 単発` 見出しの配下（次の見出し or 末尾まで）を「単発タスクエリア」とする。
-    - 既存タスクの `[date:: YYYY-MM-DD]` と比較し、追加タスクが時系列順に収まる位置へ挿入。
-    - 既存タスクが無い／最も未来の日付の場合はエリア末尾（次の見出しの直前）へ。
-    - `## 単発` 見出しが無い場合は末尾に見出しごと作成して追記。
-    - 書き換え前に必ず `.bak` を作成する。
+
+def _compute_inbox_append(existing: str, title: str, date_val, category: str, priority: str) -> str:
+    """Inbox 本文（文字列）に新 ToDo 行を `## 単発` 内へ日付昇順で挿入した新テキストを返す。
+
+    ファイル I/O から切り離した純粋関数。ローカル/Dropbox どちらの書き込み経路でも
+    同一の挿入ロジック（日付昇順＋同日内は優先度降順）を再利用する。
     """
-    path = Path(vault_dir) / INBOX_FILENAME
     parts = [f"- [ ] {title.strip()}"]
     if date_val:
         parts.append(f"[date:: {date_val}]")
@@ -1290,12 +1314,7 @@ def append_task_to_inbox(vault_dir: str, title: str, date_val, category: str, pr
         parts.append(f"[priority:: {priority}]")
     new_line = " ".join(parts)
 
-    try:
-        existing = path.read_text(encoding="utf-8") if path.exists() else ""
-    except OSError:
-        return False
-
-    lines = existing.split("\n")
+    lines = (existing or "").split("\n")
 
     # ① `## 単発` 見出しを特定
     start = None
@@ -1306,46 +1325,68 @@ def append_task_to_inbox(vault_dir: str, title: str, date_val, category: str, pr
 
     if start is None:
         # 見出しが無ければ末尾に見出しごと追加
-        new_lines = lines + ["", "## 単発", new_line]
-    else:
-        # ② 次の見出し or 末尾までを単発エリアとする
-        end = len(lines)
-        for idx in range(start + 1, len(lines)):
-            if _HEADING_RE.match(lines[idx]):
-                end = idx
-                break
+        return "\n".join(lines + ["", "## 単発", new_line])
 
-        # ③④ エリア内の既存タスクと比較し、(日付 昇順, 同日内は優先度 降順) で
-        #     収まる位置を特定する。
-        #     並び順: date asc → priority rank desc。
-        #     新タスクは「自分より後ろに来るべき最初の既存タスク」の直前に挿入する。
-        #     後ろに来る条件: date > 新date  または （date == 新date かつ rank < 新rank）
-        insert_at = end  # 既定: エリア末尾（次の見出しの直前）
-        if date_val:
-            new_rank = _priority_rank(priority or "")
-            # date_val に時間が付いていても、比較は YYYY-MM-DD 部分だけで行う
-            _dm = re.match(r"(\d{4}-\d{2}-\d{2})", str(date_val))
-            new_date_str = _dm.group(1) if _dm else str(date_val)
-            for idx in range(start + 1, end):
-                if not lines[idx].lstrip().startswith("- ["):
-                    continue
-                m = _DATE_YMD_RE.search(lines[idx])
-                if not m:
-                    continue  # 日付なしタスクは比較対象外
-                existing_date = m.group(1)
-                if existing_date > new_date_str:
-                    insert_at = idx
-                    break
-                if existing_date == new_date_str and _priority_rank(lines[idx]) < new_rank:
-                    # 同日かつ既存の優先度が低い → その手前に割り込む
-                    insert_at = idx
-                    break
-        new_lines = lines[:insert_at] + [new_line] + lines[insert_at:]
+    # ② 次の見出し or 末尾までを単発エリアとする
+    end = len(lines)
+    for idx in range(start + 1, len(lines)):
+        if _HEADING_RE.match(lines[idx]):
+            end = idx
+            break
+
+    # ③④ エリア内の既存タスクと比較し、(日付 昇順, 同日内は優先度 降順) で
+    #     収まる位置を特定する。新タスクは「自分より後ろに来るべき最初の既存
+    #     タスク」の直前に挿入する（後ろ条件: date > 新date または 同date かつ rank < 新rank）。
+    insert_at = end  # 既定: エリア末尾（次の見出しの直前）
+    if date_val:
+        new_rank = _priority_rank(priority or "")
+        _dm = re.match(r"(\d{4}-\d{2}-\d{2})", str(date_val))
+        new_date_str = _dm.group(1) if _dm else str(date_val)
+        for idx in range(start + 1, end):
+            if not lines[idx].lstrip().startswith("- ["):
+                continue
+            m = _DATE_YMD_RE.search(lines[idx])
+            if not m:
+                continue  # 日付なしタスクは比較対象外
+            existing_date = m.group(1)
+            if existing_date > new_date_str:
+                insert_at = idx
+                break
+            if existing_date == new_date_str and _priority_rank(lines[idx]) < new_rank:
+                insert_at = idx
+                break
+    new_lines = lines[:insert_at] + [new_line] + lines[insert_at:]
+    return "\n".join(new_lines)
+
+
+def append_task_to_inbox(vault_dir: str, title: str, date_val, category: str, priority: str) -> bool:
+    """新構文に準拠した ToDo 行を `## 単発` セクション内に日付昇順で挿入する。
+
+    Dropbox 認証が環境にある場合は Dropbox 上の Inbox を直接読み書きし、
+    無ければ従来どおりローカルの Inbox を更新する。いずれも書き換え前に `.bak` を作成。
+    """
+    # --- クラウド（Dropbox）経路 ---
+    if _dropbox_configured():
+        storage = get_vault_storage(vault_dir)
+        ok = storage.append_task(title, date_val, category, priority)
+        if ok:
+            load_raw_notes.clear()
+            scan_md_files.clear()
+        return ok
+
+    # --- ローカル経路（従来動作）---
+    path = Path(vault_dir) / INBOX_FILENAME
+    try:
+        existing = path.read_text(encoding="utf-8") if path.exists() else ""
+    except OSError:
+        return False
+
+    new_text = _compute_inbox_append(existing, title, date_val, category, priority)
 
     try:
         if path.exists():
             shutil.copy2(path, str(path) + ".bak")  # 安全のためバックアップ
-        path.write_text("\n".join(new_lines), encoding="utf-8")
+        path.write_text(new_text, encoding="utf-8")
         load_raw_notes.clear()
         scan_md_files.clear()
         return True
@@ -1430,6 +1471,11 @@ def push_to_github(file_path: str, content: str, commit_message: str):
 #   - 日付判定の正典 `_date_tag_verdict` や生成ロジックは一切 file I/O を持たないため、
 #     ここで「読み書きの物理層」だけを差し替えれば、PC OFF でもクラウド完結で動作する。
 # ---------------------------------------------------------------------------
+# Dropbox 上でキャッシュ（todo_cache.json）を保存する相対パス
+# （00_Daily_ToDo 配下＝ノート読込の除外対象なので、Obsidian のノートには混ざらない）
+DROPBOX_CACHE_REL = f"{EXCLUDED_DIR_NAME}/todo_cache.json"
+
+
 def _dropbox_configured() -> bool:
     """環境に Dropbox 認証情報があるか（アクセストークン単体、または Refresh 一式）。"""
     if get_secret("DROPBOX_ACCESS_TOKEN"):
@@ -1441,7 +1487,30 @@ def _dropbox_configured() -> bool:
     )
 
 
-class LocalStorage:
+class _VaultStorageBase:
+    """ローカル/Dropbox 共通の高水準操作（read_text/write_text/make_backup を基に実装）。
+
+    ここに置いた操作は物理層（read_text 等）に依存せず、純粋ロジック関数を再利用する。
+    """
+
+    def banner(self) -> str:
+        return _parse_banner_text(self.read_text(INBOX_FILENAME) or "")
+
+    def extract_categories(self):
+        return _parse_categories_text(self.read_text(INBOX_FILENAME) or "")
+
+    def append_task(self, title, date_val, category, priority) -> bool:
+        existing = self.read_text(INBOX_FILENAME) or ""
+        new_text = _compute_inbox_append(existing, title, date_val, category, priority)
+        try:
+            self.make_backup(INBOX_FILENAME)  # 書き換え前に .bak を作成
+            self.write_text(INBOX_FILENAME, new_text)
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+
+
+class LocalStorage(_VaultStorageBase):
     """ローカルファイルシステム上の Vault（従来動作）。既存の実績関数へ委譲する。"""
 
     kind = "local"
@@ -1479,8 +1548,26 @@ class LocalStorage:
     def archive(self, target_date):
         return archive_past_files(self.root, target_date)
 
+    def write_daily(self, date_str: str, content: str) -> str:
+        return str(write_daily_file_local(self.root, date_str, content))
 
-class DropboxStorage:
+    def read_cache(self) -> dict:
+        try:
+            with open(CACHE_PATH, encoding="utf-8") as f:
+                data = json.load(f)
+                return data if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def write_cache(self, cache: dict) -> None:
+        try:
+            with open(CACHE_PATH, "w", encoding="utf-8") as f:
+                json.dump(cache, f, ensure_ascii=False, indent=2)
+        except OSError:
+            pass
+
+
+class DropboxStorage(_VaultStorageBase):
     """Dropbox 上の Vault を HTTP API 経由で直接読み書きする（PC OFF でもクラウド完結）。
 
     認証は OAuth2。App Key / App Secret / Refresh Token があれば実行時に短命の
@@ -1500,11 +1587,13 @@ class DropboxStorage:
         self._app_secret = get_secret("DROPBOX_APP_SECRET")
         self._refresh = get_secret("DROPBOX_REFRESH_TOKEN")
         self._token = None
+        self._token_expiry = 0.0  # epoch 秒。期限が近づいたら自動で再取得する
 
     # -- 認証 --------------------------------------------------------------
     def _bearer(self) -> str:
         if self._refresh and self._app_key and self._app_secret:
-            if self._token:
+            # 期限まで60秒以上あるキャッシュ済みトークンはそのまま再利用する
+            if self._token and time.time() < self._token_expiry - 60:
                 return self._token
             r = requests.post(
                 "https://api.dropbox.com/oauth2/token",
@@ -1513,7 +1602,10 @@ class DropboxStorage:
                 timeout=30,
             )
             r.raise_for_status()
-            self._token = r.json()["access_token"]
+            data = r.json()
+            self._token = data["access_token"]
+            # expires_in（既定4時間）に基づき失効時刻を記録
+            self._token_expiry = time.time() + int(data.get("expires_in", 14400))
             return self._token
         if not self._access:
             raise RuntimeError("Dropbox 認証情報が不足しています。")
@@ -1721,12 +1813,44 @@ class DropboxStorage:
             })
         return result
 
+    def write_daily(self, date_str: str, content: str) -> str:
+        rel = f"{EXCLUDED_DIR_NAME}/{date_str}.md"
+        self.write_text(rel, content)
+        return rel
+
+    def read_cache(self) -> dict:
+        txt = self.read_text(DROPBOX_CACHE_REL)
+        if not txt:
+            return {}
+        try:
+            data = json.loads(txt)
+            return data if isinstance(data, dict) else {}
+        except ValueError:
+            return {}
+
+    def write_cache(self, cache: dict) -> None:
+        try:
+            self.write_text(DROPBOX_CACHE_REL, json.dumps(cache, ensure_ascii=False, indent=2))
+        except Exception:  # noqa: BLE001
+            pass
+
+
+# プロセス内でストレージインスタンスを再利用（トークン再取得の抑制）。
+# NameError ガードにより Streamlit の再実行をまたいで保持される。
+try:
+    _STORAGE_MEMO
+except NameError:
+    _STORAGE_MEMO = {}
+
 
 def get_vault_storage(vault_dir: str = None):
-    """環境に Dropbox 認証があれば DropboxStorage、無ければ LocalStorage を返す。"""
-    if _dropbox_configured():
-        return DropboxStorage()
-    return LocalStorage(vault_dir or DEFAULT_VAULT_PATH)
+    """環境に Dropbox 認証があれば DropboxStorage、無ければ LocalStorage を返す（メモ化）。"""
+    key = "dropbox" if _dropbox_configured() else f"local:{vault_dir or DEFAULT_VAULT_PATH}"
+    inst = _STORAGE_MEMO.get(key)
+    if inst is None:
+        inst = DropboxStorage() if key == "dropbox" else LocalStorage(vault_dir or DEFAULT_VAULT_PATH)
+        _STORAGE_MEMO[key] = inst
+    return inst
 
 
 # ---------------------------------------------------------------------------
@@ -1918,7 +2042,12 @@ with st.sidebar:
         vault_dir = VAULT_PRESETS[vault_choice]
 
     vault_ok = False
-    if not vault_dir:
+    if _dropbox_configured():
+        # クラウドモード: Vault は Dropbox 上。ローカルフォルダの有無は問わない。
+        vault_ok = True
+        _dbx_path = get_secret("DROPBOX_VAULT_PATH") or "(ルート)"
+        st.success(f"☁️ クラウドモード（Dropbox）: `{_dbx_path}`")
+    elif not vault_dir:
         st.info("フォルダパスを入力してください。")
     elif not Path(vault_dir).is_dir():
         st.error("指定されたフォルダが見つかりません")
@@ -2030,17 +2159,28 @@ autogen_scheduler = (
 # --- サイドバー: デバッグ情報（パスの見える化） ---
 with st.sidebar:
     with st.expander("🛠️ デバッグ情報", expanded=False):
-        # 実際にスキャンしている Vault の絶対パスを表示
-        abs_vault = os.path.abspath(vault_dir) if vault_dir else "(未指定)"
-        st.markdown("**スキャン対象 Vault（絶対パス）**")
+        _cloud = _dropbox_configured()
+        # 実際にスキャンしている Vault のパスを表示（クラウド時は Dropbox パス）
+        if _cloud:
+            abs_vault = f"[Dropbox] {get_secret('DROPBOX_VAULT_PATH') or '(ルート)'}"
+            exists_ok = True
+        else:
+            abs_vault = os.path.abspath(vault_dir) if vault_dir else "(未指定)"
+            exists_ok = bool(vault_dir and Path(vault_dir).is_dir())
+        st.markdown("**スキャン対象 Vault**")
         st.code(abs_vault, language="text")
         st.caption(
-            f"存在: {'✅ あり' if vault_dir and Path(vault_dir).is_dir() else '❌ なし'}　/　"
+            f"存在: {'✅ あり' if exists_ok else '❌ なし'}　/　"
+            f"モード: {'☁️ クラウド(Dropbox)' if _cloud else '💻 ローカル'}　/　"
             f"除外フォルダ名: `{EXCLUDED_DIR_NAME}`"
         )
 
         # フォルダ内で検出できた .md ファイルの一覧（除外前/後）
-        scan = scan_md_files(vault_dir) if vault_dir else {"all": [], "excluded": [], "loaded": []}
+        if _cloud:
+            _rels = [n["rel"] for n in load_raw_notes(vault_dir)]
+            scan = {"all": _rels, "excluded": [], "loaded": _rels}
+        else:
+            scan = scan_md_files(vault_dir) if vault_dir else {"all": [], "excluded": [], "loaded": []}
         st.markdown(
             f"**検出した .md ファイル**　"
             f"（全 {len(scan['all'])} 件 / 読込 {len(scan['loaded'])} 件 / "
@@ -2216,8 +2356,8 @@ if (generate or force_regen) and ready and all_notes:
         if force_regen:
             load_raw_notes.clear()
             scan_md_files.clear()
-            gen_notes = _read_raw_notes_from_disk(vault_dir)
-            st.caption("♻️ 強制再生成: キャッシュを無視し Obsidian の最新 Inbox を直接読み込みました。")
+            gen_notes = read_notes_fresh(vault_dir)  # Dropbox 認証時はクラウドから直接
+            st.caption("♻️ 強制再生成: キャッシュを無視し最新の Inbox を直接読み込みました。")
         else:
             gen_notes = all_notes
         with st.spinner(f"{len(to_gen)}日分のToDoを Gemini で生成中…"):
