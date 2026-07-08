@@ -1581,13 +1581,21 @@ class DropboxStorage(_VaultStorageBase):
     _RPC = "https://api.dropboxapi.com/2"
 
     def __init__(self):
-        self.base = (get_secret("DROPBOX_VAULT_PATH") or "").rstrip("/")
+        base = (get_secret("DROPBOX_VAULT_PATH") or "").strip().rstrip("/")
+        # 【パス正規化】先頭スラッシュが無い場合は自動補完する（Dropbox API はパスが
+        # "/" で始まるか完全な空文字列であることを要求するため、"Apps/xxx" のような
+        # 書き方でも malformed_path エラーにならず動作するようにする）。
+        if base and not base.startswith("/"):
+            base = "/" + base
+        self.base = base
         self._access = get_secret("DROPBOX_ACCESS_TOKEN")
         self._app_key = get_secret("DROPBOX_APP_KEY")
         self._app_secret = get_secret("DROPBOX_APP_SECRET")
         self._refresh = get_secret("DROPBOX_REFRESH_TOKEN")
         self._token = None
         self._token_expiry = 0.0  # epoch 秒。期限が近づいたら自動で再取得する
+        # 直近の list_folder で 409（path/not_found）が発生した場合の詳細（UI診断用）
+        self.last_list_error = None
 
     # -- 認証 --------------------------------------------------------------
     def _bearer(self) -> str:
@@ -1687,9 +1695,17 @@ class DropboxStorage(_VaultStorageBase):
             json={"path": path, "recursive": recursive, "limit": 2000},
             timeout=60,
         )
-        if r.status_code == 409:  # フォルダが無い
+        if r.status_code == 409:  # フォルダが無い（path/not_found 等）
+            # 【重要】ここで黙って空リストを返すと「パス設定ミス」と「本当に空」の
+            # 区別がUI側で一切できなくなるため、詳細をインスタンスに記録しておく。
+            try:
+                detail = r.json()
+            except ValueError:
+                detail = {"error_summary": r.text}
+            self.last_list_error = {"path": path, "status": 409, "detail": detail}
             return entries
         r.raise_for_status()
+        self.last_list_error = None  # 成功したので直前のエラー記録はクリア
         data = r.json()
         entries.extend(data.get("entries", []))
         while data.get("has_more"):
@@ -1833,6 +1849,80 @@ class DropboxStorage(_VaultStorageBase):
             self.write_text(DROPBOX_CACHE_REL, json.dumps(cache, ensure_ascii=False, indent=2))
         except Exception:  # noqa: BLE001
             pass
+
+    # -- 診断（UI のデバッグパネルから呼ばれる）--------------------------------
+    def diagnose(self) -> dict:
+        """Dropbox 接続・パス設定の問題を切り分けるための診断情報を集める。
+
+        「.md が1件も見つからない」原因が (a) 認証情報の間違い、(b) パス設定ミス、
+        (c) Full Dropbox / App folder のアクセス権スコープの取り違え、
+        (d) 本当にファイルが無い、のどれかを UI 上で判別できるようにする。
+        """
+        result = {
+            "configured_base": self.base or "(空文字 = ルート)",
+            "auth_ok": False,
+            "auth_error": None,
+            "account_email": None,
+            "root_listing": None,     # トークン自身のルート（"" ）を list_folder した結果
+            "root_error": None,
+            "base_listing": None,     # 設定された base パスを list_folder した結果
+            "base_error": None,
+        }
+        # 1) 認証確認（アクセストークンが取得できるか）
+        try:
+            self._bearer()
+            result["auth_ok"] = True
+        except Exception as e:  # noqa: BLE001
+            result["auth_error"] = str(e)
+            return result  # 認証できなければ以降は無意味
+
+        # 2) アカウント情報（どの Dropbox アカウントに繋がっているか）
+        try:
+            r = requests.post(
+                f"{self._RPC}/users/get_current_account",
+                headers=self._headers(), timeout=15,
+            )
+            if r.status_code == 200:
+                result["account_email"] = r.json().get("email")
+        except requests.RequestException as e:
+            result["account_error"] = str(e)
+
+        # 3) トークン自身のルート（"" ）を列挙。
+        #    App Folder スコープのアプリなら、ここに Vault の中身が直接見える。
+        #    Full Dropbox スコープなら、ここには "Apps" 等の最上位フォルダが見える。
+        try:
+            r = requests.post(
+                f"{self._RPC}/files/list_folder",
+                headers=self._headers(),
+                json={"path": "", "recursive": False, "limit": 50},
+                timeout=30,
+            )
+            if r.status_code == 200:
+                entries = r.json().get("entries", [])
+                result["root_listing"] = [
+                    f"{'📁' if e.get('.tag') == 'folder' else '📄'} {e.get('name')}"
+                    for e in entries
+                ]
+            else:
+                result["root_error"] = r.json() if r.content else {"status": r.status_code}
+        except requests.RequestException as e:
+            result["root_error"] = str(e)
+
+        # 4) 設定された DROPBOX_VAULT_PATH（base）を列挙。
+        #    409（path/not_found）の場合は「パス自体が存在しない」と「パスは存在するが
+        #    中身が空」を区別できるよう、base_listing は None のままにして base_error に詳細を残す。
+        try:
+            entries = self._list_folder("", recursive=False)
+            if self.last_list_error is not None:
+                result["base_error"] = self.last_list_error
+            else:
+                result["base_listing"] = [
+                    f"{'📁' if e.get('.tag') == 'folder' else '📄'} {e.get('name')}"
+                    for e in entries
+                ]
+        except requests.RequestException as e:
+            result["base_error"] = str(e)
+        return result
 
 
 # プロセス内でストレージインスタンスを再利用（トークン再取得の抑制）。
@@ -2196,9 +2286,68 @@ with st.sidebar:
                 st.write(f"- ⛔ `{rel}`")
         if not scan["all"]:
             st.warning("このフォルダ内に .md ファイルが1件も見つかりません。")
+            if _cloud:
+                _storage = get_vault_storage(vault_dir)
+                _err = getattr(_storage, "last_list_error", None)
+                if _err:
+                    st.error(
+                        f"⚠️ Dropbox が `{_err.get('path')}` を **path/not_found** "
+                        "として返しました（＝そのパスがDropbox上に存在しません）。"
+                    )
+                    st.code(json.dumps(_err.get("detail"), ensure_ascii=False, indent=2), language="json")
+
+        # --- Dropbox 接続診断（クラウドモードのみ）---
+        if _cloud:
+            st.divider()
+            if st.button("🔍 Dropbox 接続診断を実行", key="dbx_diag_btn"):
+                with st.spinner("Dropbox に接続して診断中…"):
+                    diag = get_vault_storage(vault_dir).diagnose()
+                st.markdown("**認証**")
+                if diag["auth_ok"]:
+                    st.success(f"✅ 認証成功" + (f"（アカウント: `{diag['account_email']}`）" if diag.get("account_email") else ""))
+                else:
+                    st.error(f"❌ 認証失敗: {diag['auth_error']}")
+                st.markdown(f"**設定された `DROPBOX_VAULT_PATH`**: `{diag['configured_base']}`")
+
+                st.markdown("**① トークン自身のルート（`\"\"`）の中身**")
+                st.caption(
+                    "ここに Vault の中身（ToDo_Inbox 等）が直接見えるなら、その Dropbox アプリは "
+                    "**App folder** スコープです → `DROPBOX_VAULT_PATH` は空にするか、"
+                    "ここに表示されたフォルダ名だけを指定してください（`/Apps/...` は不要）。"
+                )
+                if diag["root_listing"] is not None:
+                    if diag["root_listing"]:
+                        for item in diag["root_listing"]:
+                            st.write(f"- {item}")
+                    else:
+                        st.caption("(空)")
+                else:
+                    st.error(f"取得失敗: {diag['root_error']}")
+
+                st.markdown("**② 設定された `DROPBOX_VAULT_PATH` の中身**")
+                if diag["base_listing"] is not None:
+                    if diag["base_listing"]:
+                        for item in diag["base_listing"]:
+                            st.write(f"- {item}")
+                        st.success("✅ このパスは存在し、中身が読めています。")
+                    else:
+                        st.warning("パスは存在しますが、中身が空です。")
+                elif diag["base_error"]:
+                    st.error(
+                        "❌ このパスは Dropbox 上に見つかりません（path/not_found）。"
+                        "①の一覧と見比べて `DROPBOX_VAULT_PATH` を修正してください。"
+                    )
+                    st.code(json.dumps(diag["base_error"], ensure_ascii=False, indent=2, default=str), language="json")
 
 if ready and len(all_notes) == 0:
     st.warning("`.md` ファイルが1件も見つかりませんでした。フォルダパスを確認してください。")
+    if _dropbox_configured():
+        st.info(
+            "☁️ クラウド(Dropbox)モードで動作中です。サイドバーの「🛠️ デバッグ情報」内にある"
+            "「🔍 Dropbox 接続診断を実行」ボタンで原因を特定できます。"
+            "よくある原因: `DROPBOX_VAULT_PATH` が実際のフォルダと一致していない、"
+            "または Dropbox アプリの権限スコープ（Full Dropbox / App folder）の取り違え。"
+        )
 
 # ---------------------------------------------------------------------------
 # 日付・期間指定 UI
