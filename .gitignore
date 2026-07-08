@@ -1,0 +1,9 @@
+# Streamlit secrets（APIキー・トークン等の秘密情報。絶対にコミットしない）
+.streamlit/secrets.toml
+
+# Python
+__pycache__/
+*.pyc
+
+# ローカル ToDo キャッシュ（実行のたびに再生成される・個人のタスク内容を含む）
+todo_cache.json
