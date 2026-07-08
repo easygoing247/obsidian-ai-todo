@@ -1493,18 +1493,27 @@ class _VaultStorageBase:
     ここに置いた操作は物理層（read_text 等）に依存せず、純粋ロジック関数を再利用する。
     """
 
+    def _resolve_rel(self, rel: str) -> str:
+        """相対パスの実体解決。既定ではそのまま返す。
+
+        Dropbox 実装では、`self.base`（DROPBOX_VAULT_PATH）が実際の Vault
+        ルートと厳密に一致しない場合の自己修復ロジックをここでオーバーライドする。
+        """
+        return rel
+
     def banner(self) -> str:
-        return _parse_banner_text(self.read_text(INBOX_FILENAME) or "")
+        return _parse_banner_text(self.read_text(self._resolve_rel(INBOX_FILENAME)) or "")
 
     def extract_categories(self):
-        return _parse_categories_text(self.read_text(INBOX_FILENAME) or "")
+        return _parse_categories_text(self.read_text(self._resolve_rel(INBOX_FILENAME)) or "")
 
     def append_task(self, title, date_val, category, priority) -> bool:
-        existing = self.read_text(INBOX_FILENAME) or ""
+        rel = self._resolve_rel(INBOX_FILENAME)
+        existing = self.read_text(rel) or ""
         new_text = _compute_inbox_append(existing, title, date_val, category, priority)
         try:
-            self.make_backup(INBOX_FILENAME)  # 書き換え前に .bak を作成
-            self.write_text(INBOX_FILENAME, new_text)
+            self.make_backup(rel)  # 書き換え前に .bak を作成
+            self.write_text(rel, new_text)
             return True
         except Exception:  # noqa: BLE001
             return False
@@ -1596,6 +1605,8 @@ class DropboxStorage(_VaultStorageBase):
         self._token_expiry = 0.0  # epoch 秒。期限が近づいたら自動で再取得する
         # 直近の list_folder で 409（path/not_found）が発生した場合の詳細（UI診断用）
         self.last_list_error = None
+        # INBOX_FILENAME の実体解決結果のメモ化（self.base 不一致への自己修復キャッシュ）
+        self._inbox_rel_cache = None
 
     # -- 認証 --------------------------------------------------------------
     def _bearer(self) -> str:
@@ -1726,6 +1737,40 @@ class DropboxStorage(_VaultStorageBase):
             return path_display[len(self.base):].lstrip("/")
         return path_display.lstrip("/")
 
+    def _resolve_rel(self, rel: str) -> str:
+        """Inbox（INBOX_FILENAME）の実体パスを自己修復的に解決する。
+
+        【背景】`self.base`（DROPBOX_VAULT_PATH）が実際の Vault ルートと厳密に一致しない
+        場合、`self.base + INBOX_FILENAME` の直接パス GET/PUT は 409（path/not_found）で
+        静かに失敗する。一方 `load_notes()` は再帰列挙のため `self.base` の多少のズレに
+        関わらず .md ファイルを発見できてしまい、「タスク読み込みは成功するのに
+        カテゴリ／バナー／新規追加だけ空になる」という非対称な症状を生む。
+        これを避けるため、直接パスが失敗した場合は再帰列挙から Inbox を探し出し、
+        見つかった実際の相対パスを以降ずっと使い回す（インスタンス内でメモ化）。
+        """
+        if rel != INBOX_FILENAME:
+            return rel
+        if self._inbox_rel_cache is not None:
+            return self._inbox_rel_cache
+        if self.exists(INBOX_FILENAME):
+            self._inbox_rel_cache = INBOX_FILENAME
+            return INBOX_FILENAME
+        target_name = INBOX_FILENAME.rsplit("/", 1)[-1].lower()
+        try:
+            for e in self._list_folder("", recursive=True):
+                if e.get(".tag") != "file":
+                    continue
+                if e.get("name", "").lower() != target_name:
+                    continue
+                found_rel = self._rel_of(e.get("path_display", e.get("name", "")))
+                self._inbox_rel_cache = found_rel
+                return found_rel
+        except requests.RequestException:
+            pass
+        # 発見できなければ既定値のまま（新規作成時等のフォールバック）
+        self._inbox_rel_cache = INBOX_FILENAME
+        return INBOX_FILENAME
+
     # -- 高水準操作 --------------------------------------------------------
     def load_notes(self):
         """Vault 配下の .md を再帰列挙し、00_Daily_ToDo を除外して読み込む。"""
@@ -1746,13 +1791,14 @@ class DropboxStorage(_VaultStorageBase):
         return notes
 
     def cleanup_inbox(self, saved_date_strs):
-        text = self.read_text(INBOX_FILENAME)
+        rel = self._resolve_rel(INBOX_FILENAME)
+        text = self.read_text(rel)
         if text is None:
             return 0
         new_text, removed = _compute_inbox_cleanup(text, saved_date_strs)
         if removed:
-            self.make_backup(INBOX_FILENAME)  # .bak を Dropbox 上に作成
-            self.write_text(INBOX_FILENAME, new_text)
+            self.make_backup(rel)  # .bak を Dropbox 上に作成
+            self.write_text(rel, new_text)
         return removed
 
     def copy_fx_scenario(self, target_date):
@@ -1867,6 +1913,8 @@ class DropboxStorage(_VaultStorageBase):
             "root_error": None,
             "base_listing": None,     # 設定された base パスを list_folder した結果
             "base_error": None,
+            "inbox_resolved_path": None,   # 実際に読み書きに使われている Inbox の相対パス
+            "inbox_self_healed": False,    # True なら直接パスが失敗し自動発見で代替した
         }
         # 1) 認証確認（アクセストークンが取得できるか）
         try:
@@ -1922,6 +1970,11 @@ class DropboxStorage(_VaultStorageBase):
                 ]
         except requests.RequestException as e:
             result["base_error"] = str(e)
+
+        # 5) Inbox の実体パス解決状況（直接パス失敗時の自己修復が発動したか）
+        resolved = self._resolve_rel(INBOX_FILENAME)
+        result["inbox_resolved_path"] = resolved
+        result["inbox_self_healed"] = resolved != INBOX_FILENAME
         return result
 
 
@@ -1993,7 +2046,7 @@ def run_headless_generation(vault_dir: str = None, target_date: date = None) -> 
             except Exception:  # noqa: BLE001
                 pass
             # 4) 書き込み直前に最終防壁を再適用（冪等）し、日次ファイルを保存
-            inbox_text = storage.read_text(INBOX_FILENAME) or ""
+            inbox_text = storage.read_text(storage._resolve_rel(INBOX_FILENAME)) or ""
             banner_value = _parse_banner_text(inbox_text)
             body_clean, final_dropped = enforce_today_only_output(body, target_date)
             summary["final_dropped"] = final_dropped
@@ -2338,6 +2391,18 @@ with st.sidebar:
                         "①の一覧と見比べて `DROPBOX_VAULT_PATH` を修正してください。"
                     )
                     st.code(json.dumps(diag["base_error"], ensure_ascii=False, indent=2, default=str), language="json")
+
+                st.markdown("**③ Inbox（カテゴリ/バナー/新規追加が参照するファイル）**")
+                if diag["inbox_self_healed"]:
+                    st.warning(
+                        f"⚠️ `DROPBOX_VAULT_PATH` + `{INBOX_FILENAME}` の直接パスでは"
+                        "見つからなかったため、Vault全体を検索して自動的に "
+                        f"`{diag['inbox_resolved_path']}` を発見し、代わりに使用しています。"
+                        "\n\n動作はしますが、`DROPBOX_VAULT_PATH` の設定が実際のVaultルートと"
+                        "ズレている可能性が高いです。①②の一覧を見比べて正しい値に修正することを推奨します。"
+                    )
+                else:
+                    st.success(f"✅ `{diag['inbox_resolved_path']}` を直接パスで読み書きできています。")
 
 if ready and len(all_notes) == 0:
     st.warning("`.md` ファイルが1件も見つかりませんでした。フォルダパスを確認してください。")
