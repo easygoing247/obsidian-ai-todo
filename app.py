@@ -1321,13 +1321,16 @@ def _default_done_template() -> str:
 
 
 def _compute_done_append(existing_done_text: str, removed_blocks: list) -> str:
-    """削除されたタスクブロックを、カテゴリごとに Done ファイルの該当見出し配下へ
-    追記した新テキストを返す純粋関数。
+    """削除されたタスクブロックを、カテゴリごとに Done ファイルの該当見出し直後へ
+    挿入した新テキストを返す純粋関数。
 
-    - 該当する `## <カテゴリ名>` 見出しが既にあれば、そのセクション末尾
-      （次の見出し行の直前、またはファイル末尾）に追記する。
-    - 見出しが無ければ、末尾に見出しごと新設して追記する。
+    - 該当する `## <カテゴリ名>` 見出しが既にあれば、その【見出しの直後（先頭）】に
+      挿入する。新しく転記されたタスクほど上に来るため、日付の新しい順に並ぶ
+      （＝古いタスクほど下にずれていく）。
+    - 見出しが無ければ、末尾に見出しごと新設して追記する（この場合は必然的に
+      見出し直後＝唯一のタスクなので位置の違いは生じない）。
     - Done ファイルが未作成/空の場合は、既知の6見出しからなる初期テンプレートを土台にする。
+    - 他の見出し・その配下の既存タスクの順序には一切手を加えない。
     """
     if not removed_blocks:
         return existing_done_text
@@ -1359,13 +1362,8 @@ def _compute_done_append(existing_done_text: str, removed_blocks: list) -> str:
             lines.append(heading)
             lines.extend(insert_lines)
         else:
-            # 次の見出し行、または末尾までがこのセクション
-            end = len(lines)
-            for idx in range(start + 1, len(lines)):
-                if lines[idx].lstrip().startswith("#"):
-                    end = idx
-                    break
-            lines = lines[:end] + insert_lines + lines[end:]
+            # 見出し行の直後（そのセクションの先頭）に挿入する
+            lines = lines[:start + 1] + insert_lines + lines[start + 1:]
 
     return "\n".join(lines)
 
