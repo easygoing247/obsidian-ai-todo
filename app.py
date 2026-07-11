@@ -1188,7 +1188,8 @@ def cleanup_inbox_singles(vault_dir: str, saved_date_strs) -> int:
     保存済み日付（saved_date_strs のいずれか）に対応するものを Inbox から削除する。
 
     詳細メモ（インデント行）もセットで削除。安全のため書き換え前に .bak を作成。
-    戻り値: 削除したタスク数。
+    削除したタスクは、同じフォルダ内の `ToDo_Inbox_Done.md` へ元のカテゴリ別に
+    転記（アーカイブ）してから Inbox を書き換える。戻り値: 削除したタスク数。
 
     【重要な設計上の保証】
     - `[date::]` タグを持たないタスク（＝ `[w::]`/`[m::]`/`[y::]` のみの定期タスク）は
@@ -1211,7 +1212,7 @@ def cleanup_inbox_singles(vault_dir: str, saved_date_strs) -> int:
     except OSError:
         return 0
 
-    new_text, removed = _compute_inbox_cleanup(text, saved_date_strs)
+    new_text, removed, removed_blocks = _compute_inbox_cleanup(text, saved_date_strs)
 
     if removed:
         try:
@@ -1219,6 +1220,7 @@ def cleanup_inbox_singles(vault_dir: str, saved_date_strs) -> int:
         except OSError:
             pass
         path.write_text(new_text, encoding="utf-8")
+        get_vault_storage(vault_dir)._record_done_tasks(INBOX_FILENAME, removed_blocks)
         load_raw_notes.clear()
         scan_md_files.clear()
     return removed
@@ -1230,19 +1232,28 @@ def _compute_inbox_cleanup(text: str, saved_date_strs) -> tuple:
 
     ファイル I/O から切り離すことで、ローカル/Dropbox どちらの書き込み経路でも
     同一の「範囲保持お掃除ロジック（_is_deletable_date_task）」を再利用できる。
-    戻り値: (お掃除後テキスト, 削除タスク数)
+    戻り値: (お掃除後テキスト, 削除タスク数, 削除ブロック一覧)
+      削除ブロック一覧の各要素は (category_name, [block_lines]) のタプル。
+      category_name は削除時点で通過していた既知の見出し名（例: "単発"）で、
+      ToDo_Inbox_Done.md への転記先セクションの判定に使う。
     """
     saved = set(saved_date_strs)
     lines = text.split("\n")
     out = []
     in_singles = False
+    current_category = None  # 直近に通過した既知カテゴリ見出し（##/### どちらでも可）
     removed = 0
+    removed_blocks = []
     i, n = 0, len(lines)
     while i < n:
         line = lines[i]
         stripped = line.strip()
-        if stripped.startswith("## "):
-            in_singles = stripped == "## 単発"
+        if stripped.startswith("#"):
+            if stripped.startswith("## "):
+                in_singles = stripped == "## 単発"
+            cat = _classify_done_heading(line)
+            if cat is not None:
+                current_category = cat
             out.append(line)
             i += 1
             continue
@@ -1254,18 +1265,109 @@ def _compute_inbox_cleanup(text: str, saved_date_strs) -> tuple:
             and _is_deletable_date_task(line, saved)
         ):
             # この行＋直下インデント詳細メモ行をまとめて削除
+            block = [line]
             removed += 1
             i += 1
             while i < n:
                 nxt = lines[i]
                 if nxt.strip() == "" or not (nxt.startswith(" ") or nxt.startswith("\t")):
                     break
+                block.append(nxt)
                 i += 1
+            removed_blocks.append((current_category or "単発", block))
             continue
         out.append(line)
         i += 1
 
-    return "\n".join(out), removed
+    return "\n".join(out), removed, removed_blocks
+
+
+# ---------------------------------------------------------------------------
+# ToDo_Inbox_Done.md への転記（削除タスクのカテゴリ別アーカイブ）
+# ---------------------------------------------------------------------------
+DONE_BASENAME = "ToDo_Inbox_Done.md"
+# ToDo_Inbox.md の見出し構造（## 定期 > ### 毎日/毎週/毎月/毎年、## 今だけ.../## 単発）に
+# 対応する Done ファイル側の正典カテゴリ名（Done 側はすべて `##` レベルに平坦化する）。
+DONE_HEADINGS_ORDER = ["毎日", "毎週（曜日指定）", "毎月", "毎年", "今だけ毎日意識すること", "単発"]
+_DONE_CATEGORY_NAMES = set(DONE_HEADINGS_ORDER)
+_DONE_HEADING_TEXT_RE = re.compile(r"^#{1,6}\s*(.+?)\s*$")
+
+
+def _classify_done_heading(line: str):
+    """見出し行が Done ファイルの既知カテゴリ名に一致すればそのカテゴリ名を返す。
+
+    `##`/`###` などレベルを問わず、見出しテキストの完全一致で判定する
+    （例: `### 毎日` も `## 毎日` も同じ "毎日" として扱う）。
+    一致しない見出し（`## 定期`, `## 記述方法` 等）は None を返す。
+    """
+    m = _DONE_HEADING_TEXT_RE.match(line.strip())
+    if not m:
+        return None
+    text = m.group(1).strip()
+    return text if text in _DONE_CATEGORY_NAMES else None
+
+
+def _done_path_for(inbox_rel: str) -> str:
+    """Inbox の実相対パスと同じフォルダ内にある Done ファイルの相対パスを返す。"""
+    inbox_rel = (inbox_rel or "").replace("\\", "/")
+    if "/" in inbox_rel:
+        return inbox_rel.rsplit("/", 1)[0] + "/" + DONE_BASENAME
+    return DONE_BASENAME
+
+
+def _default_done_template() -> str:
+    """ToDo_Inbox_Done.md が存在しない場合の初期テンプレート（既知の見出しのみ）。"""
+    return "\n\n".join(f"## {name}" for name in DONE_HEADINGS_ORDER) + "\n"
+
+
+def _compute_done_append(existing_done_text: str, removed_blocks: list) -> str:
+    """削除されたタスクブロックを、カテゴリごとに Done ファイルの該当見出し配下へ
+    追記した新テキストを返す純粋関数。
+
+    - 該当する `## <カテゴリ名>` 見出しが既にあれば、そのセクション末尾
+      （次の見出し行の直前、またはファイル末尾）に追記する。
+    - 見出しが無ければ、末尾に見出しごと新設して追記する。
+    - Done ファイルが未作成/空の場合は、既知の6見出しからなる初期テンプレートを土台にする。
+    """
+    if not removed_blocks:
+        return existing_done_text
+
+    text = existing_done_text if existing_done_text and existing_done_text.strip() else _default_done_template()
+    lines = text.split("\n")
+
+    # カテゴリごとにブロックをグルーピング（渡された順序を維持）
+    grouped = {}
+    for category, block in removed_blocks:
+        grouped.setdefault(category, []).append(block)
+
+    for category, blocks in grouped.items():
+        heading = f"## {category}"
+        insert_lines = []
+        for block in blocks:
+            insert_lines.extend(block)
+
+        start = None
+        for idx, l in enumerate(lines):
+            if l.strip() == heading:
+                start = idx
+                break
+
+        if start is None:
+            # 見出しが無ければ末尾に見出しごと新設
+            if lines and lines[-1].strip() != "":
+                lines.append("")
+            lines.append(heading)
+            lines.extend(insert_lines)
+        else:
+            # 次の見出し行、または末尾までがこのセクション
+            end = len(lines)
+            for idx in range(start + 1, len(lines)):
+                if lines[idx].lstrip().startswith("#"):
+                    end = idx
+                    break
+            lines = lines[:end] + insert_lines + lines[end:]
+
+    return "\n".join(lines)
 
 
 _CATEGORY_RE = re.compile(r"\[category::\s*(.*?)\]")
@@ -1517,6 +1619,26 @@ class _VaultStorageBase:
             return True
         except Exception:  # noqa: BLE001
             return False
+
+    def _record_done_tasks(self, inbox_rel: str, removed_blocks: list) -> None:
+        """Inbox から削除されたタスクブロックを、同じフォルダの ToDo_Inbox_Done.md へ
+        カテゴリ別に追記する（Local/Dropbox 共通・read_text/write_text/make_backup
+        経由なので物理層に依存しない）。
+
+        転記に失敗しても Inbox 側の削除は既に完了しているため、ここでは例外を
+        飲み込んで処理を継続する（Done への転記漏れは致命的ではない）。
+        """
+        if not removed_blocks:
+            return
+        done_rel = _done_path_for(inbox_rel)
+        try:
+            existing = self.read_text(done_rel) or ""
+            new_text = _compute_done_append(existing, removed_blocks)
+            if existing:
+                self.make_backup(done_rel)
+            self.write_text(done_rel, new_text)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 class LocalStorage(_VaultStorageBase):
@@ -1795,10 +1917,11 @@ class DropboxStorage(_VaultStorageBase):
         text = self.read_text(rel)
         if text is None:
             return 0
-        new_text, removed = _compute_inbox_cleanup(text, saved_date_strs)
+        new_text, removed, removed_blocks = _compute_inbox_cleanup(text, saved_date_strs)
         if removed:
             self.make_backup(rel)  # .bak を Dropbox 上に作成
             self.write_text(rel, new_text)
+            self._record_done_tasks(rel, removed_blocks)
         return removed
 
     def copy_fx_scenario(self, target_date):
