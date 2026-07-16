@@ -2272,6 +2272,27 @@ def get_daily_autogen_scheduler(vault_dir: str, hour: int = 5):
     return sched
 
 
+def _select_time_hm(container, label: str, default: dt_time, key_prefix: str) -> dt_time:
+    """「時」「分」を横並びの selectbox で選択させ、結果を datetime.time で返す。
+
+    st.time_input(step=1分刻み) は1440件の巨大ドロップダウンになり操作性が
+    悪いため、24件（時）× 60件（分）の2つの selectbox に分割して選ばせる。
+    戻り値は既存の time_input ベースのロジック（.strftime('%H:%M') 等）と
+    完全互換の datetime.time オブジェクト。
+    """
+    container.caption(label)
+    hc, mc = container.columns(2)
+    hour = hc.selectbox(
+        "時", options=list(range(24)), index=default.hour,
+        key=f"{key_prefix}_hour", format_func=lambda h: f"{h:02d}",
+    )
+    minute = mc.selectbox(
+        "分", options=list(range(60)), index=default.minute,
+        key=f"{key_prefix}_minute", format_func=lambda m: f"{m:02d}",
+    )
+    return dt_time(hour, minute)
+
+
 # ---------------------------------------------------------------------------
 # UI
 # ---------------------------------------------------------------------------
@@ -2360,17 +2381,11 @@ with st.sidebar:
     if new_use_date and new_use_time:
         time_mode = st.radio("時間の指定方法", [TIME_SINGLE, TIME_RANGE], key="new_time_mode")
         if time_mode == TIME_SINGLE:
-            t_start = st.time_input(
-                "時間", value=dt_time(10, 0), step=timedelta(minutes=1), key="new_time_start"
-            )
+            t_start = _select_time_hm(st, "時間", dt_time(10, 0), "new_time_start")
         else:
             tc1, tc2 = st.columns(2)
-            t_start = tc1.time_input(
-                "開始", value=dt_time(10, 0), step=timedelta(minutes=1), key="new_time_start"
-            )
-            t_end = tc2.time_input(
-                "終了", value=dt_time(12, 0), step=timedelta(minutes=1), key="new_time_end"
-            )
+            t_start = _select_time_hm(tc1, "開始", dt_time(10, 0), "new_time_start")
+            t_end = _select_time_hm(tc2, "終了", dt_time(12, 0), "new_time_end")
 
     cat_choice = st.selectbox("カテゴリー（category::）", category_options, key="new_cat_choice")
     if cat_choice == NEW_CATEGORY_LABEL:
