@@ -2360,11 +2360,17 @@ with st.sidebar:
     if new_use_date and new_use_time:
         time_mode = st.radio("時間の指定方法", [TIME_SINGLE, TIME_RANGE], key="new_time_mode")
         if time_mode == TIME_SINGLE:
-            t_start = st.time_input("時間", value=dt_time(10, 0), key="new_time_start")
+            t_start = st.time_input(
+                "時間", value=dt_time(10, 0), step=timedelta(minutes=1), key="new_time_start"
+            )
         else:
             tc1, tc2 = st.columns(2)
-            t_start = tc1.time_input("開始", value=dt_time(10, 0), key="new_time_start")
-            t_end = tc2.time_input("終了", value=dt_time(12, 0), key="new_time_end")
+            t_start = tc1.time_input(
+                "開始", value=dt_time(10, 0), step=timedelta(minutes=1), key="new_time_start"
+            )
+            t_end = tc2.time_input(
+                "終了", value=dt_time(12, 0), step=timedelta(minutes=1), key="new_time_end"
+            )
 
     cat_choice = st.selectbox("カテゴリー（category::）", category_options, key="new_cat_choice")
     if cat_choice == NEW_CATEGORY_LABEL:
