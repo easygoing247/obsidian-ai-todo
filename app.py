@@ -160,6 +160,11 @@ def _read_raw_notes_from_disk(notes_dir: str):
         # パスのいずれかの階層名に一致すれば、そのファイルをスキップ。
         if EXCLUDED_DIR_NAME in md.parts:
             continue
+        # ToDo_Inbox_Done.md（削除済みタスクのアーカイブ）は日次生成の参照対象から除外。
+        # 含めてしまうと、既に完了・転記済みのタスクが [w::]/[date::] タグ一致で
+        # 当日の ToDo として復活してしまうため。
+        if md.name == DONE_BASENAME:
+            continue
         try:
             text = md.read_text(encoding="utf-8")
         except (UnicodeDecodeError, OSError):
@@ -217,7 +222,7 @@ def scan_md_files(notes_dir: str):
         except ValueError:
             rel = md.name
         result["all"].append(rel)
-        if EXCLUDED_DIR_NAME in md.parts:
+        if EXCLUDED_DIR_NAME in md.parts or md.name == DONE_BASENAME:
             result["excluded"].append(rel)
         else:
             result["loaded"].append(rel)
@@ -1001,6 +1006,69 @@ def build_daily_file_content(body: str, banner: str) -> str:
     return f"---\nbanner: {banner}\n---\n\n{body.strip()}\n"
 
 
+# ---------------------------------------------------------------------------
+# ### メモ セクション（優先度：低 の直下）の前日引き継ぎ
+# ---------------------------------------------------------------------------
+MEMO_HEADING = "### メモ"
+_MEMO_HEADING_LINE_RE = re.compile(r"^#{1,6}\s")
+
+
+def _extract_memo_section(daily_body: str) -> str:
+    """日次ファイル本文（Frontmatter を含んでいても可）から `### メモ` セクションの
+    中身（見出し行自体は含まない）を抽出する。見出しが無ければ空文字。純粋関数。
+    """
+    if not daily_body:
+        return ""
+    lines = daily_body.split("\n")
+    start = None
+    for idx, l in enumerate(lines):
+        if l.strip() == MEMO_HEADING:
+            start = idx
+            break
+    if start is None:
+        return ""
+    end = len(lines)
+    for idx in range(start + 1, len(lines)):
+        if _MEMO_HEADING_LINE_RE.match(lines[idx]):
+            end = idx
+            break
+    content_lines = lines[start + 1:end]
+    while content_lines and content_lines[0].strip() == "":
+        content_lines.pop(0)
+    while content_lines and content_lines[-1].strip() == "":
+        content_lines.pop()
+    return "\n".join(content_lines)
+
+
+def _append_memo_section(body: str, memo_content: str) -> str:
+    """本文の末尾（＝優先度：低 の直下）に `### メモ` セクションを追加する。
+
+    メモ見出しは常に付与する（テンプレートの標準構成のため）。引き継ぐ内容が
+    無い場合は見出しのみになる。純粋関数。
+    """
+    body = (body or "").rstrip()
+    section = MEMO_HEADING + ("\n" + memo_content if memo_content else "")
+    if not body:
+        return section
+    return body + "\n" + section
+
+
+def _carry_over_memo(storage, target_date: date) -> str:
+    """前日の Daily ToDo ファイルが存在すれば、その `### メモ` の中身を返す（無ければ空文字）。
+
+    転記に失敗しても日次生成全体を止めないよう、例外は飲み込む（致命的ではない）。
+    """
+    try:
+        prev_str = (target_date - timedelta(days=1)).strftime("%Y-%m-%d")
+        prev_rel = f"{EXCLUDED_DIR_NAME}/{prev_str}.md"
+        prev_text = storage.read_text(prev_rel)
+        if not prev_text:
+            return ""
+        return _extract_memo_section(prev_text)
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def write_daily_file_local(vault_dir: str, date_str: str, content: str):
     """vault の 00_Daily_ToDo/ に YYYY-MM-DD.md を作成（上書き）する。
 
@@ -1399,14 +1467,30 @@ def extract_categories(vault_dir: str):
     return get_vault_storage(vault_dir).extract_categories()
 
 
-def _compute_inbox_append(existing: str, title: str, date_val, category: str, priority: str) -> str:
-    """Inbox 本文（文字列）に新 ToDo 行を `## 単発` 内へ日付昇順で挿入した新テキストを返す。
+def _compute_inbox_append(
+    existing: str,
+    title: str,
+    date_val,
+    category: str,
+    priority: str,
+    repeat_tag: str = None,
+    repeat_heading: str = None,
+) -> str:
+    """Inbox 本文（文字列）に新 ToDo 行を挿入した新テキストを返す純粋関数。
+
+    - `repeat_tag`（`[w:: ...]`/`[m:: ...]`/`[y:: ...]`）が指定された場合は、
+      `repeat_heading`（例: "毎日"／"毎週（曜日指定）"／"毎月"／"毎年"）に一致する
+      見出し（`##`/`### レベル問わず完全一致）の直後（セクション先頭）へ挿入する。
+      見出しが無ければ末尾に `### <repeat_heading>` を新設して追記する。
+    - 指定が無ければ従来どおり `## 単発` 内へ `[date:: ...]` 付きで日付昇順に挿入する。
 
     ファイル I/O から切り離した純粋関数。ローカル/Dropbox どちらの書き込み経路でも
-    同一の挿入ロジック（日付昇順＋同日内は優先度降順）を再利用する。
+    同一の挿入ロジックを再利用する。
     """
     parts = [f"- [ ] {title.strip()}"]
-    if date_val:
+    if repeat_tag:
+        parts.append(repeat_tag)
+    elif date_val:
         parts.append(f"[date:: {date_val}]")
     if category and category.strip():
         parts.append(f"[category:: {category.strip()}]")
@@ -1415,6 +1499,18 @@ def _compute_inbox_append(existing: str, title: str, date_val, category: str, pr
     new_line = " ".join(parts)
 
     lines = (existing or "").split("\n")
+
+    if repeat_tag and repeat_heading:
+        # 繰り返しタスク: 該当する見出し（レベル問わず完全一致）の直後に挿入
+        start = None
+        for idx, l in enumerate(lines):
+            m = _DONE_HEADING_TEXT_RE.match(l.strip())
+            if m and m.group(1).strip() == repeat_heading:
+                start = idx
+                break
+        if start is None:
+            return "\n".join(lines + ["", f"### {repeat_heading}", new_line])
+        return "\n".join(lines[:start + 1] + [new_line] + lines[start + 1:])
 
     # ① `## 単発` 見出しを特定
     start = None
@@ -1459,8 +1555,20 @@ def _compute_inbox_append(existing: str, title: str, date_val, category: str, pr
     return "\n".join(new_lines)
 
 
-def append_task_to_inbox(vault_dir: str, title: str, date_val, category: str, priority: str) -> bool:
-    """新構文に準拠した ToDo 行を `## 単発` セクション内に日付昇順で挿入する。
+def append_task_to_inbox(
+    vault_dir: str,
+    title: str,
+    date_val,
+    category: str,
+    priority: str,
+    repeat_tag: str = None,
+    repeat_heading: str = None,
+) -> bool:
+    """新構文に準拠した ToDo 行を Inbox へ挿入する。
+
+    `repeat_tag`/`repeat_heading` が指定されていれば繰り返しタスクとして該当見出し
+    （毎日／毎週（曜日指定）／毎月／毎年）の直後へ、無ければ従来どおり `## 単発`
+    セクション内に日付昇順で挿入する。
 
     Dropbox 認証が環境にある場合は Dropbox 上の Inbox を直接読み書きし、
     無ければ従来どおりローカルの Inbox を更新する。いずれも書き換え前に `.bak` を作成。
@@ -1468,7 +1576,7 @@ def append_task_to_inbox(vault_dir: str, title: str, date_val, category: str, pr
     # --- クラウド（Dropbox）経路 ---
     if _dropbox_configured():
         storage = get_vault_storage(vault_dir)
-        ok = storage.append_task(title, date_val, category, priority)
+        ok = storage.append_task(title, date_val, category, priority, repeat_tag, repeat_heading)
         if ok:
             load_raw_notes.clear()
             scan_md_files.clear()
@@ -1481,7 +1589,7 @@ def append_task_to_inbox(vault_dir: str, title: str, date_val, category: str, pr
     except OSError:
         return False
 
-    new_text = _compute_inbox_append(existing, title, date_val, category, priority)
+    new_text = _compute_inbox_append(existing, title, date_val, category, priority, repeat_tag, repeat_heading)
 
     try:
         if path.exists():
@@ -1607,10 +1715,10 @@ class _VaultStorageBase:
     def extract_categories(self):
         return _parse_categories_text(self.read_text(self._resolve_rel(INBOX_FILENAME)) or "")
 
-    def append_task(self, title, date_val, category, priority) -> bool:
+    def append_task(self, title, date_val, category, priority, repeat_tag=None, repeat_heading=None) -> bool:
         rel = self._resolve_rel(INBOX_FILENAME)
         existing = self.read_text(rel) or ""
-        new_text = _compute_inbox_append(existing, title, date_val, category, priority)
+        new_text = _compute_inbox_append(existing, title, date_val, category, priority, repeat_tag, repeat_heading)
         try:
             self.make_backup(rel)  # 書き換え前に .bak を作成
             self.write_text(rel, new_text)
@@ -1901,6 +2009,9 @@ class DropboxStorage(_VaultStorageBase):
             name = e.get("name", "")
             if not name.lower().endswith(".md"):
                 continue
+            if name == DONE_BASENAME:
+                # ToDo_Inbox_Done.md は日次生成の参照対象から除外（完了済みタスクの復活防止）
+                continue
             rel = self._rel_of(e.get("path_display", name))
             if EXCLUDED_DIR_NAME in rel.split("/"):
                 continue
@@ -2171,7 +2282,10 @@ def run_headless_generation(vault_dir: str = None, target_date: date = None) -> 
             banner_value = _parse_banner_text(inbox_text)
             body_clean, final_dropped = enforce_today_only_output(body, target_date)
             summary["final_dropped"] = final_dropped
-            content = build_daily_file_content(body_clean, banner_value)
+            memo_content = _carry_over_memo(storage, target_date)
+            summary["memo_carried"] = bool(memo_content)
+            body_with_memo = _append_memo_section(body_clean, memo_content)
+            content = build_daily_file_content(body_with_memo, banner_value)
             daily_rel = f"{EXCLUDED_DIR_NAME}/{date_str}.md"
             storage.write_text(daily_rel, content)
             summary["saved_path"] = f"[{storage.kind}] {daily_rel}"
@@ -2300,6 +2414,13 @@ st.set_page_config(page_title="Obsidian ToDo 生成", page_icon="✅", layout="c
 st.title("✅ Obsidian ToDo リスト生成")
 st.caption("選んだ日付に該当するタスクを、Obsidianノートから動的に抽出します。")
 
+# rerun をまたいでも確実に見えるよう、追加成功メッセージは session_state 経由で
+# 次の描画（このタイミング）で trigger する。
+_pending_toast = st.session_state.pop("_new_task_toast", None)
+if _pending_toast:
+    st.toast(_pending_toast, icon="✅")
+    st.success(_pending_toast)
+
 # APIキーのチェック
 api_ok = True
 if not GEMINI_API_KEY:
@@ -2346,13 +2467,12 @@ with st.sidebar:
         scan_md_files.clear()
         st.rerun()
 
-    # --- 新規 ToDo を Inbox に直接追加（## 単発 へ日付昇順で挿入） ---
+    # --- 新規 ToDo を Inbox に直接追加（## 単発 へ日付昇順 or 繰り返しセクションへ） ---
     st.divider()
     st.markdown("#### 📥 Inboxに新規ToDoを追加")
     st.caption(
-        "繰り返しは種ノートに記法で追記します： "
-        "曜日 `[w:: Mon,Wed,Fri]` / 毎日 `[w:: Everyday]`（英語3文字）、"
-        "月次 `[m:: 13]` または `[m:: 1,15]`、年次 `[y:: 6,11]`（月,日）。"
+        "繰り返しを選ぶと `[w::]`/`[m::]`/`[y::]` タグが自動で付与され、"
+        "「## 定期」配下の該当セクションへ追加されます。"
     )
 
     # カテゴリーは Inbox から動的抽出してプルダウン化（末尾に「(新規入力)」）
@@ -2361,31 +2481,75 @@ with st.sidebar:
     category_options = existing_categories + [NEW_CATEGORY_LABEL]
 
     new_title = st.text_input("タスクタイトル", placeholder="例: メルマガ原稿を書く", key="new_title")
-    new_use_date = st.checkbox("日付（date::）を付ける", value=True, key="new_use_date")
-    new_date = st.date_input("日付（開始日）", value=today_jst(), key="new_task_date")
 
-    # 期間（範囲）指定（日付ありの場合のみ有効）
-    new_use_range = st.checkbox("📅 期間（範囲）を指定する", value=False, key="new_use_range", disabled=not new_use_date)
+    # --- 繰り返し設定 ---
+    REPEAT_NONE = "なし（単発／日付指定）"
+    REPEAT_EVERYDAY = "毎日"
+    REPEAT_WEEKDAY = "曜日を指定"
+    REPEAT_MONTHLY = "毎月（日を指定）"
+    REPEAT_YEARLY = "毎年（月日を指定）"
+    REPEAT_OPTIONS = [REPEAT_NONE, REPEAT_EVERYDAY, REPEAT_WEEKDAY, REPEAT_MONTHLY, REPEAT_YEARLY]
+    _REPEAT_HEADING_MAP = {
+        REPEAT_EVERYDAY: "毎日",
+        REPEAT_WEEKDAY: "毎週（曜日指定）",
+        REPEAT_MONTHLY: "毎月",
+        REPEAT_YEARLY: "毎年",
+    }
+    _WEEKDAY_JA_EN = [
+        ("月", "Mon"), ("火", "Tue"), ("水", "Wed"), ("木", "Thu"),
+        ("金", "Fri"), ("土", "Sat"), ("日", "Sun"),
+    ]
+
+    new_repeat_mode = st.selectbox("繰り返し", REPEAT_OPTIONS, key="new_repeat_mode")
+    new_is_repeat = new_repeat_mode != REPEAT_NONE
+
+    picked_weekdays_ja = []
+    picked_month_days = []
+    repeat_year_month = repeat_year_day = 1
+    if new_repeat_mode == REPEAT_WEEKDAY:
+        picked_weekdays_ja = st.multiselect(
+            "曜日を選択（複数可）", [ja for ja, _ in _WEEKDAY_JA_EN], key="new_repeat_weekdays"
+        )
+    elif new_repeat_mode == REPEAT_MONTHLY:
+        picked_month_days = st.multiselect(
+            "日を選択（複数可）", list(range(1, 32)), key="new_repeat_month_days"
+        )
+    elif new_repeat_mode == REPEAT_YEARLY:
+        yc1, yc2 = st.columns(2)
+        repeat_year_month = yc1.selectbox("月", list(range(1, 13)), key="new_repeat_year_month")
+        repeat_year_day = yc2.selectbox("日", list(range(1, 32)), key="new_repeat_year_day")
+
+    # --- 単発（日付指定）の入力は「繰り返しなし」のときのみ表示 ---
+    new_use_date = False
+    new_date = today_jst()
+    new_use_range = False
     new_end_date = None
-    if new_use_date and new_use_range:
-        new_end_date = st.date_input("終了日", value=new_date, key="new_task_end_date")
-        if new_end_date < new_date:
-            st.warning("終了日が開始日より前です。")
-
-    # 時間指定（日付ありの場合のみ有効）
-    TIME_SINGLE = "特定の時間（例: 10:00）"
-    TIME_RANGE = "時間帯を指定（例: 10:00-12:00）"
-    new_use_time = st.checkbox("時間を指定する", value=False, key="new_use_time", disabled=not new_use_date)
+    new_use_time = False
     time_mode = None
     t_start = t_end = None
-    if new_use_date and new_use_time:
-        time_mode = st.radio("時間の指定方法", [TIME_SINGLE, TIME_RANGE], key="new_time_mode")
-        if time_mode == TIME_SINGLE:
-            t_start = _select_time_hm(st, "時間", dt_time(10, 0), "new_time_start")
-        else:
-            tc1, tc2 = st.columns(2)
-            t_start = _select_time_hm(tc1, "開始", dt_time(10, 0), "new_time_start")
-            t_end = _select_time_hm(tc2, "終了", dt_time(12, 0), "new_time_end")
+    TIME_SINGLE = "特定の時間（例: 10:00）"
+    TIME_RANGE = "時間帯を指定（例: 10:00-12:00）"
+    if not new_is_repeat:
+        new_use_date = st.checkbox("日付（date::）を付ける", value=True, key="new_use_date")
+        new_date = st.date_input("日付（開始日）", value=today_jst(), key="new_task_date")
+
+        # 期間（範囲）指定（日付ありの場合のみ有効）
+        new_use_range = st.checkbox("📅 期間（範囲）を指定する", value=False, key="new_use_range", disabled=not new_use_date)
+        if new_use_date and new_use_range:
+            new_end_date = st.date_input("終了日", value=new_date, key="new_task_end_date")
+            if new_end_date < new_date:
+                st.warning("終了日が開始日より前です。")
+
+        # 時間指定（日付ありの場合のみ有効）
+        new_use_time = st.checkbox("時間を指定する", value=False, key="new_use_time", disabled=not new_use_date)
+        if new_use_date and new_use_time:
+            time_mode = st.radio("時間の指定方法", [TIME_SINGLE, TIME_RANGE], key="new_time_mode")
+            if time_mode == TIME_SINGLE:
+                t_start = _select_time_hm(st, "時間", dt_time(10, 0), "new_time_start")
+            else:
+                tc1, tc2 = st.columns(2)
+                t_start = _select_time_hm(tc1, "開始", dt_time(10, 0), "new_time_start")
+                t_end = _select_time_hm(tc2, "終了", dt_time(12, 0), "new_time_end")
 
     cat_choice = st.selectbox("カテゴリー（category::）", category_options, key="new_cat_choice")
     if cat_choice == NEW_CATEGORY_LABEL:
@@ -2401,29 +2565,59 @@ with st.sidebar:
             st.error("Vault が未設定のため追加できません。")
         elif not new_title.strip():
             st.error("タスクタイトルを入力してください。")
+        elif new_repeat_mode == REPEAT_WEEKDAY and not picked_weekdays_ja:
+            st.error("曜日を1つ以上選択してください。")
+        elif new_repeat_mode == REPEAT_MONTHLY and not picked_month_days:
+            st.error("日を1つ以上選択してください。")
         else:
-            # 日付（任意で範囲）＋（任意で）時間を [date:: ...] 用の文字列に組み立てる
+            repeat_tag = None
+            repeat_heading = None
             date_value = None
-            if new_use_date:
-                date_value = new_date.strftime("%Y-%m-%d")
-                # 期間指定 ON: 開始日-終了日 のレンジ形式（ハイフン繋ぎ）
-                if new_use_range and new_end_date is not None:
-                    date_value += f"-{new_end_date.strftime('%Y-%m-%d')}"
-                # 時間指定 ON: 末尾に時間（範囲日付の後ろにも結合可能）
-                if new_use_time and t_start is not None:
-                    if time_mode == TIME_RANGE and t_end is not None:
-                        date_value += f" {t_start.strftime('%H:%M')}-{t_end.strftime('%H:%M')}"
-                    else:
-                        date_value += f" {t_start.strftime('%H:%M')}"
+            success_msg = None
+
+            if new_repeat_mode == REPEAT_EVERYDAY:
+                repeat_tag = "[w:: Everyday]"
+                repeat_heading = _REPEAT_HEADING_MAP[REPEAT_EVERYDAY]
+                success_msg = f"Inbox の「## 定期 > ### {repeat_heading}」に追加しました！"
+            elif new_repeat_mode == REPEAT_WEEKDAY:
+                en_days = [en for ja, en in _WEEKDAY_JA_EN if ja in picked_weekdays_ja]
+                repeat_tag = f"[w:: {','.join(en_days)}]"
+                repeat_heading = _REPEAT_HEADING_MAP[REPEAT_WEEKDAY]
+                success_msg = f"Inbox の「## 定期 > ### {repeat_heading}」に追加しました！"
+            elif new_repeat_mode == REPEAT_MONTHLY:
+                repeat_tag = f"[m:: {','.join(str(d) for d in sorted(picked_month_days))}]"
+                repeat_heading = _REPEAT_HEADING_MAP[REPEAT_MONTHLY]
+                success_msg = f"Inbox の「## 定期 > ### {repeat_heading}」に追加しました！"
+            elif new_repeat_mode == REPEAT_YEARLY:
+                repeat_tag = f"[y:: {repeat_year_month},{repeat_year_day}]"
+                repeat_heading = _REPEAT_HEADING_MAP[REPEAT_YEARLY]
+                success_msg = f"Inbox の「## 定期 > ### {repeat_heading}」に追加しました！"
+            else:
+                # 単発: 日付（任意で範囲）＋（任意で）時間を [date:: ...] 用の文字列に組み立てる
+                if new_use_date:
+                    date_value = new_date.strftime("%Y-%m-%d")
+                    # 期間指定 ON: 開始日-終了日 のレンジ形式（ハイフン繋ぎ）
+                    if new_use_range and new_end_date is not None:
+                        date_value += f"-{new_end_date.strftime('%Y-%m-%d')}"
+                    # 時間指定 ON: 末尾に時間（範囲日付の後ろにも結合可能）
+                    if new_use_time and t_start is not None:
+                        if time_mode == TIME_RANGE and t_end is not None:
+                            date_value += f" {t_start.strftime('%H:%M')}-{t_end.strftime('%H:%M')}"
+                        else:
+                            date_value += f" {t_start.strftime('%H:%M')}"
+                success_msg = "Inbox の「## 単発」に日付順で追加しました！"
+
             ok = append_task_to_inbox(
                 vault_dir,
                 new_title,
                 date_value,
                 new_category,
                 new_priority,
+                repeat_tag,
+                repeat_heading,
             )
             if ok:
-                st.success("Inbox の「## 単発」に日付順で追加しました！")
+                st.session_state["_new_task_toast"] = f"✅ 新規ToDoを追加しました！（{success_msg}）"
                 st.rerun()
             else:
                 st.error("Inbox への追記に失敗しました。")
@@ -2758,7 +2952,9 @@ for date_str in ordered_dates:
         else:
             # 【最終防壁】書き込み直前に今日以外の日付タスクを物理排除（冪等）
             body_clean, final_dropped = enforce_today_only_output(body, d)
-            content = build_daily_file_content(body_clean, banner_value)
+            memo_content = _carry_over_memo(get_vault_storage(vault_dir), d)
+            body_with_memo = _append_memo_section(body_clean, memo_content)
+            content = build_daily_file_content(body_with_memo, banner_value)
             saved_path = write_daily_file_local(vault_dir, date_str, content)
             # 「## 単発」かつ [date::] を持つ該当タスクを Inbox から自動削除
             removed = cleanup_inbox_singles(vault_dir, [date_str])
@@ -2830,6 +3026,8 @@ if savable_dates and st.button("📂 Obsidianへ保存（GitHubへ一括Push）"
             try:
                 _d_save = date.fromisoformat(date_str)
                 _body_save, _ = enforce_today_only_output(cache[date_str], _d_save)
+                _memo_content = _carry_over_memo(get_vault_storage(vault_dir), _d_save) if vault_ok else ""
+                _body_save = _append_memo_section(_body_save, _memo_content)
             except ValueError:
                 _body_save = cache[date_str]
             content = build_daily_file_content(_body_save, banner_value)
