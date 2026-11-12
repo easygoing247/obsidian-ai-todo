@@ -17,10 +17,12 @@ ObsidianAiTodo — 日付指定 ToDo リスト生成アプリ
 """
 
 import base64
+import hashlib
 import json
 import os
 import re
 import shutil
+import sys
 import threading
 import time
 from datetime import date, datetime, time as dt_time, timedelta, timezone
@@ -973,8 +975,88 @@ def load_cache() -> dict:
 
 
 def save_cache(cache: dict) -> None:
-    """ToDo キャッシュを永続化する（Dropbox 認証があればクラウド、無ければローカル）。"""
-    get_vault_storage().write_cache(cache)
+    """ToDo キャッシュを永続化する（Dropbox 認証があればクラウド、無ければローカル）。
+
+    UI が古い時点で読み込んだキャッシュを書き戻しても、別系統（GitHub Actions /
+    常駐スケジューラ）が記録した生成完了マーカーが消えないよう、保存直前に
+    最新のマーカーを読み直してマージする。
+    """
+    storage = get_vault_storage()
+    storage.write_cache(_merge_autogen_marker(storage, cache))
+
+
+# ---------------------------------------------------------------------------
+# 日次生成の冪等化（完了マーカー）と書き込み競合の検知
+# ---------------------------------------------------------------------------
+# todo_cache.json 内の予約キー。値は { 'YYYY-MM-DD': {"hash", "generated_at", "storage"} }。
+# 日付キー（'YYYY-MM-DD'）とは衝突しないため、既存のキャッシュ参照には影響しない。
+AUTOGEN_DONE_KEY = "_autogen_done"
+AUTOGEN_MARKER_KEEP_DAYS = 60
+
+
+class WriteConflict(Exception):
+    """読み取り後に他所で変更された（または既に存在する）ため、書き込みを見送ったことを表す。"""
+
+
+def _content_hash(text: str) -> str:
+    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
+
+
+def _autogen_log(msg: str) -> None:
+    """GitHub Actions / Streamlit Cloud のどちらでもログに残るよう標準出力へ書く。"""
+    line = f"[autogen {datetime.now(JST).strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
+    try:
+        print(line, flush=True)
+    except Exception:  # noqa: BLE001  ログ出力の失敗で生成処理を止めない（例: cp932 端末）
+        try:
+            enc = getattr(sys.stdout, "encoding", None) or "ascii"
+            print(line.encode(enc, errors="replace").decode(enc, errors="replace"), flush=True)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _merge_autogen_marker(storage, cache: dict) -> dict:
+    """保存しようとしている cache に、ストレージ上の最新の完了マーカーをマージして返す。"""
+    try:
+        latest = storage.read_cache().get(AUTOGEN_DONE_KEY)
+    except Exception:  # noqa: BLE001
+        latest = None
+    if not isinstance(latest, dict):
+        return cache
+    merged = dict(latest)
+    own = cache.get(AUTOGEN_DONE_KEY)
+    if isinstance(own, dict):
+        merged.update(own)
+    out = dict(cache)
+    out[AUTOGEN_DONE_KEY] = merged
+    return out
+
+
+def _get_autogen_marker(storage, date_str: str):
+    markers = storage.read_cache().get(AUTOGEN_DONE_KEY)
+    if isinstance(markers, dict):
+        m = markers.get(date_str)
+        return m if isinstance(m, dict) else None
+    return None
+
+
+def _record_autogen_done(storage, date_str: str, body: str, content: str) -> bool:
+    """生成成功時のみ呼ぶ。キャッシュ本文と完了マーカーを記録し、書けたかを検証して返す。"""
+    cache = storage.read_cache()
+    cache[date_str] = body
+    markers = cache.get(AUTOGEN_DONE_KEY)
+    markers = dict(markers) if isinstance(markers, dict) else {}
+    markers[date_str] = {
+        "hash": _content_hash(content),
+        "generated_at": datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S"),
+        "storage": storage.kind,
+        "runner": "github_actions" if os.environ.get("GITHUB_ACTIONS") == "true" else "app",
+    }
+    cutoff = (date.fromisoformat(date_str) - timedelta(days=AUTOGEN_MARKER_KEEP_DAYS)).isoformat()
+    markers = {k: v for k, v in markers.items() if k >= cutoff}
+    cache[AUTOGEN_DONE_KEY] = markers
+    storage.write_cache(cache)
+    return _get_autogen_marker(storage, date_str) is not None
 
 
 def _parse_banner_text(text: str) -> str:
@@ -1070,18 +1152,16 @@ def _carry_over_memo(storage, target_date: date) -> str:
 
 
 def write_daily_file_local(vault_dir: str, date_str: str, content: str):
-    """vault の 00_Daily_ToDo/ に YYYY-MM-DD.md を作成（上書き）する。
+    """vault の 00_Daily_ToDo/ に YYYY-MM-DD.md を【新規作成のみ】で書き込む。
 
+    既に同名ファイルがある場合はユーザー編集を守るため上書きせず WriteConflict を送出する。
     Dropbox 認証があればクラウド上へ直接書き込み（戻り値は相対パス文字列）、
     無ければローカルへ書き込む（戻り値は Path）。
     """
+    rel = get_vault_storage(vault_dir).write_daily(date_str, content)
     if _dropbox_configured():
-        return get_vault_storage(vault_dir).write_daily(date_str, content)
-    folder = Path(vault_dir) / EXCLUDED_DIR_NAME
-    folder.mkdir(parents=True, exist_ok=True)
-    target = folder / f"{date_str}.md"
-    target.write_text(content, encoding="utf-8")
-    return target
+        return rel
+    return Path(vault_dir) / rel
 
 
 def _is_deletable_date_task(line: str, saved: set) -> bool:
@@ -1266,29 +1346,14 @@ def cleanup_inbox_singles(vault_dir: str, saved_date_strs) -> int:
     - 期間指定タスク（`[date:: YYYY-MM-DD-YYYY-MM-DD]`）は終了日の保存まで削除されない
       （`_is_deletable_date_task` が終了日以降のみ True を返す設計による）。
     """
-    # Dropbox 認証があればクラウド上の Inbox を直接お掃除（.bak も Dropbox 上に作成）
-    if _dropbox_configured():
-        removed = get_vault_storage(vault_dir).cleanup_inbox(saved_date_strs)
-        if removed:
-            load_raw_notes.clear()
-            scan_md_files.clear()
-        return removed
-
-    path = Path(vault_dir) / INBOX_FILENAME
+    # Dropbox 認証があればクラウド上、無ければローカルの Inbox をお掃除する。
+    # 書き戻しは読み取り時点の rev 指定で行い、途中で他所が更新していたら書き戻さない。
     try:
-        text = path.read_text(encoding="utf-8")
-    except OSError:
+        removed = get_vault_storage(vault_dir).cleanup_inbox(saved_date_strs)
+    except WriteConflict as e:
+        _autogen_log(f"Inbox お掃除を見送りました（競合）: {e}")
         return 0
-
-    new_text, removed, removed_blocks = _compute_inbox_cleanup(text, saved_date_strs)
-
     if removed:
-        try:
-            shutil.copy2(path, str(path) + ".bak")  # 安全のためバックアップ
-        except OSError:
-            pass
-        path.write_text(new_text, encoding="utf-8")
-        get_vault_storage(vault_dir)._record_done_tasks(INBOX_FILENAME, removed_blocks)
         load_raw_notes.clear()
         scan_md_files.clear()
     return removed
@@ -1573,33 +1638,13 @@ def append_task_to_inbox(
     Dropbox 認証が環境にある場合は Dropbox 上の Inbox を直接読み書きし、
     無ければ従来どおりローカルの Inbox を更新する。いずれも書き換え前に `.bak` を作成。
     """
-    # --- クラウド（Dropbox）経路 ---
-    if _dropbox_configured():
-        storage = get_vault_storage(vault_dir)
-        ok = storage.append_task(title, date_val, category, priority, repeat_tag, repeat_heading)
-        if ok:
-            load_raw_notes.clear()
-            scan_md_files.clear()
-        return ok
-
-    # --- ローカル経路（従来動作）---
-    path = Path(vault_dir) / INBOX_FILENAME
-    try:
-        existing = path.read_text(encoding="utf-8") if path.exists() else ""
-    except OSError:
-        return False
-
-    new_text = _compute_inbox_append(existing, title, date_val, category, priority, repeat_tag, repeat_heading)
-
-    try:
-        if path.exists():
-            shutil.copy2(path, str(path) + ".bak")  # 安全のためバックアップ
-        path.write_text(new_text, encoding="utf-8")
+    # Dropbox / ローカルとも同じ経路（読み取り時点の rev を指定して書き戻す）
+    storage = get_vault_storage(vault_dir)
+    ok = storage.append_task(title, date_val, category, priority, repeat_tag, repeat_heading)
+    if ok:
         load_raw_notes.clear()
         scan_md_files.clear()
-        return True
-    except OSError:
-        return False
+    return ok
 
 
 # ---------------------------------------------------------------------------
@@ -1717,14 +1762,42 @@ class _VaultStorageBase:
 
     def append_task(self, title, date_val, category, priority, repeat_tag=None, repeat_heading=None) -> bool:
         rel = self._resolve_rel(INBOX_FILENAME)
-        existing = self.read_text(rel) or ""
-        new_text = _compute_inbox_append(existing, title, date_val, category, priority, repeat_tag, repeat_heading)
+        existing, rev = self.read_text_rev(rel)
+        new_text = _compute_inbox_append(existing or "", title, date_val, category, priority, repeat_tag, repeat_heading)
         try:
-            self.make_backup(rel)  # 書き換え前に .bak を作成
-            self.write_text(rel, new_text)
+            if existing is not None:
+                self.make_backup(rel)  # 書き換え前に .bak を作成
+            self.write_text_if_rev(rel, new_text, rev)
             return True
+        except WriteConflict as e:
+            _autogen_log(f"Inbox へのタスク追加を見送りました（競合）: {e}")
+            return False
         except Exception:  # noqa: BLE001
             return False
+
+    def cleanup_inbox(self, saved_date_strs) -> int:
+        """Inbox から保存済み日付の単発タスクを除去して書き戻す（Local/Dropbox 共通）。
+
+        読み取り時点の rev を指定して書き戻し、読み取り後に他所（PC/スマホの同期や
+        別系統の生成）が Inbox を更新していた場合は書き戻さずに WriteConflict を送出する。
+        .bak の作成は従来どおり書き戻し前に行う。
+        """
+        rel = self._resolve_rel(INBOX_FILENAME)
+        text, rev = self.read_text_rev(rel)
+        if text is None:
+            return 0
+        new_text, removed, removed_blocks = _compute_inbox_cleanup(text, saved_date_strs)
+        if removed:
+            self.make_backup(rel)
+            self.write_text_if_rev(rel, new_text, rev)
+            self._record_done_tasks(rel, removed_blocks)
+        return removed
+
+    def write_daily(self, date_str: str, content: str) -> str:
+        """日次ファイルを新規作成のみで書き込む（既存なら WriteConflict）。相対パスを返す。"""
+        rel = f"{EXCLUDED_DIR_NAME}/{date_str}.md"
+        self.write_text_if_rev(rel, content, None)
+        return rel
 
     def _record_done_tasks(self, inbox_rel: str, removed_blocks: list) -> None:
         """Inbox から削除されたタスクブロックを、同じフォルダの ToDo_Inbox_Done.md へ
@@ -1769,6 +1842,35 @@ class LocalStorage(_VaultStorageBase):
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding="utf-8")
 
+    def read_text_rev(self, rel: str):
+        """(本文, rev) を返す。ローカルの rev は更新時刻(ns)とサイズ。無ければ (None, None)。"""
+        p = Path(self.root) / rel
+        try:
+            st_ = p.stat()
+            return p.read_text(encoding="utf-8"), f"{st_.st_mtime_ns}:{st_.st_size}"
+        except OSError:
+            return None, None
+
+    def write_text_if_rev(self, rel: str, content: str, rev):
+        """rev=None なら新規作成のみ、rev 指定なら現行が同じ rev のときだけ書き込む。"""
+        p = Path(self.root) / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        if rev is None:
+            try:
+                with open(p, "x", encoding="utf-8") as f:
+                    f.write(content)
+            except FileExistsError:
+                raise WriteConflict(f"{rel} は既に存在するため上書きしません") from None
+            return
+        try:
+            st_ = p.stat()
+            cur = f"{st_.st_mtime_ns}:{st_.st_size}"
+        except OSError:
+            cur = None
+        if cur != rev:
+            raise WriteConflict(f"{rel} は読み取り後に変更されています")
+        p.write_text(content, encoding="utf-8")
+
     def make_backup(self, rel: str):
         src = Path(self.root) / rel
         try:
@@ -1776,17 +1878,11 @@ class LocalStorage(_VaultStorageBase):
         except OSError:
             pass
 
-    def cleanup_inbox(self, saved_date_strs):
-        return cleanup_inbox_singles(self.root, saved_date_strs)
-
     def copy_fx_scenario(self, target_date):
         return copy_fx_scenario_template(self.root, target_date)
 
     def archive(self, target_date):
         return archive_past_files(self.root, target_date)
-
-    def write_daily(self, date_str: str, content: str) -> str:
-        return str(write_daily_file_local(self.root, date_str, content))
 
     def read_cache(self) -> dict:
         try:
@@ -1895,6 +1991,56 @@ class DropboxStorage(_VaultStorageBase):
             data=content.encode("utf-8"),
             timeout=60,
         )
+        r.raise_for_status()
+
+    def read_text_rev(self, rel: str):
+        """(本文, rev) を返す。rev は Dropbox のファイルリビジョン。無ければ (None, None)。"""
+        arg = json.dumps({"path": self._abs(rel)})
+        r = requests.post(
+            f"{self._CONTENT}/files/download",
+            headers=self._headers({"Dropbox-API-Arg": arg}),
+            timeout=60,
+        )
+        if r.status_code == 200:
+            try:
+                rev = json.loads(r.headers.get("Dropbox-API-Result", "{}")).get("rev")
+            except ValueError:
+                rev = None
+            if not rev:
+                raise RuntimeError(f"{rel} の rev を取得できませんでした")
+            return r.content.decode("utf-8", errors="ignore"), rev
+        if r.status_code == 409:  # not_found
+            return None, None
+        r.raise_for_status()
+
+    def write_text_if_rev(self, rel: str, content: str, rev):
+        """rev=None なら新規作成のみ（add）、rev 指定なら update モードで書き込む。
+
+        読み取り後に他所で変更されていた（rev 不一致）／既に存在していた場合、
+        Dropbox は path/conflict を返すので、上書きせず WriteConflict を送出する。
+        """
+        mode = {".tag": "update", "update": rev} if rev else {".tag": "add"}
+        arg = json.dumps(
+            {
+                "path": self._abs(rel),
+                "mode": mode,
+                "autorename": False,
+                "mute": True,
+                "strict_conflict": True,
+            }
+        )
+        r = requests.post(
+            f"{self._CONTENT}/files/upload",
+            headers=self._headers(
+                {"Dropbox-API-Arg": arg, "Content-Type": "application/octet-stream"}
+            ),
+            data=content.encode("utf-8"),
+            timeout=60,
+        )
+        if r.status_code == 409 and "conflict" in r.text:
+            if rev:
+                raise WriteConflict(f"{rel} は読み取り後に変更されています（rev 不一致）")
+            raise WriteConflict(f"{rel} は既に存在するため上書きしません")
         r.raise_for_status()
 
     def exists(self, rel: str) -> bool:
@@ -2021,18 +2167,6 @@ class DropboxStorage(_VaultStorageBase):
             notes.append({"rel": rel, "text": txt, "chars": len(txt)})
         return notes
 
-    def cleanup_inbox(self, saved_date_strs):
-        rel = self._resolve_rel(INBOX_FILENAME)
-        text = self.read_text(rel)
-        if text is None:
-            return 0
-        new_text, removed, removed_blocks = _compute_inbox_cleanup(text, saved_date_strs)
-        if removed:
-            self.make_backup(rel)  # .bak を Dropbox 上に作成
-            self.write_text(rel, new_text)
-            self._record_done_tasks(rel, removed_blocks)
-        return removed
-
     def copy_fx_scenario(self, target_date):
         """平日のみ FX テンプレートを日付付きで複製（土日/既存/テンプレ無しはスキップ）。"""
         if target_date.weekday() >= 5:
@@ -2106,11 +2240,6 @@ class DropboxStorage(_VaultStorageBase):
                 "yearly_fx": _move_dirs(FX_SCENARIO_DIR),
             })
         return result
-
-    def write_daily(self, date_str: str, content: str) -> str:
-        rel = f"{EXCLUDED_DIR_NAME}/{date_str}.md"
-        self.write_text(rel, content)
-        return rel
 
     def read_cache(self) -> dict:
         txt = self.read_text(DROPBOX_CACHE_REL)
@@ -2261,23 +2390,41 @@ def run_headless_generation(vault_dir: str = None, target_date: date = None) -> 
         "error": None,
         "ran_at": datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S"),
     }
+    summary["skipped"] = False
+    summary["skip_reason"] = None
+    summary["inbox_conflict"] = False
+    summary["marker_recorded"] = False
     with _HEADLESS_LOCK:
         try:
             storage = get_vault_storage(vault_dir)
             summary["storage"] = storage.kind
+            daily_rel = f"{EXCLUDED_DIR_NAME}/{date_str}.md"
+            # 0) 【冪等化】当日分が生成済み（完了マーカーあり）か、当日ファイルが既に
+            #    存在する場合は、当日ファイルにも Inbox にも一切書き込まずに終了する。
+            #    生成は GitHub Actions と常駐スケジューラの2系統から1日に複数回起動され得るため、
+            #    2回目以降が日中のユーザー編集を「生成直後の状態」へ巻き戻さないようにする。
+            marker = _get_autogen_marker(storage, date_str)
+            existing_text, _existing_rev = storage.read_text_rev(daily_rel)
+            if marker or existing_text is not None:
+                if existing_text is None:
+                    reason = "生成済み（完了マーカーあり）。当日ファイルは見当たらないが再生成しない"
+                elif marker and _content_hash(existing_text) == marker.get("hash"):
+                    reason = "生成済み（完了マーカーあり・生成直後の内容のまま）"
+                elif marker:
+                    reason = "生成済み（完了マーカーあり・ユーザー編集あり）。上書きしない"
+                else:
+                    reason = "当日ファイルが既に存在（完了マーカーなし）。ユーザー編集保護のため上書きしない"
+                summary.update(skipped=True, skip_reason=reason, ok=True,
+                               saved_path=f"[{storage.kind}] {daily_rel}")
+                _autogen_log(f"{date_str}: スキップ: {reason}")
+                return summary
             # 1) キャッシュ強制バイパス: 毎回ストレージから最新の Vault を直接パース
             notes = storage.load_notes()
             # 2) 対象日の ToDo を生成（事前フィルタ→Gemini→救済→最終防壁は既存の堅牢ロジック）
             results = generate_todos_for_dates([target_date], notes)
             body = results.get(date_str, "")
-            # 3) todo_cache.json を最新状態でクリーンに上書き（ローカル実行時の高速表示用）
-            try:
-                cache = load_cache()
-                cache[date_str] = body
-                save_cache(cache)
-            except Exception:  # noqa: BLE001
-                pass
-            # 4) 書き込み直前に最終防壁を再適用（冪等）し、日次ファイルを保存
+            # 3) 書き込み直前に最終防壁を再適用（冪等）し、日次ファイルを【新規作成のみ】で保存。
+            #    生成中に他系統が先に作成していた場合は WriteConflict となり、上書きしない。
             inbox_text = storage.read_text(storage._resolve_rel(INBOX_FILENAME)) or ""
             banner_value = _parse_banner_text(inbox_text)
             body_clean, final_dropped = enforce_today_only_output(body, target_date)
@@ -2286,14 +2433,23 @@ def run_headless_generation(vault_dir: str = None, target_date: date = None) -> 
             summary["memo_carried"] = bool(memo_content)
             body_with_memo = _append_memo_section(body_clean, memo_content)
             content = build_daily_file_content(body_with_memo, banner_value)
-            daily_rel = f"{EXCLUDED_DIR_NAME}/{date_str}.md"
-            storage.write_text(daily_rel, content)
+            try:
+                storage.write_daily(date_str, content)
+            except WriteConflict as e:
+                reason = f"生成中に当日ファイルが作成されたため上書きしない（{e}）"
+                summary.update(skipped=True, skip_reason=reason, ok=True)
+                _autogen_log(f"{date_str}: スキップ: {reason}")
+                return summary
             summary["saved_path"] = f"[{storage.kind}] {daily_rel}"
-            # 5) Inbox お掃除（範囲保持ロジックは cleanup 側で担保・書き戻しも同ストレージへ）
+            _autogen_log(f"{date_str}: 当日ファイルを新規作成しました ({storage.kind})")
+            # 4) Inbox お掃除（読み取り時点の rev 指定で書き戻し。競合時は書き戻さない）
             try:
                 summary["inbox_removed"] = storage.cleanup_inbox([date_str])
-            except Exception:  # noqa: BLE001
-                pass
+            except WriteConflict as e:
+                summary["inbox_conflict"] = True
+                _autogen_log(f"{date_str}: Inbox お掃除を見送りました（競合）: {e}")
+            except Exception as e:  # noqa: BLE001
+                _autogen_log(f"{date_str}: Inbox お掃除でエラー（続行）: {e}")
             # 6) FX シナリオ複製（平日のみ・土日は自動スキップ）
             summary["fx"] = storage.copy_fx_scenario(target_date)
             # 7) 月次/年次アーカイブ（毎月1日のみ発動）
@@ -2305,9 +2461,14 @@ def run_headless_generation(vault_dir: str = None, target_date: date = None) -> 
                 content=content,
                 commit_message=f"auto: Generate Daily ToDo & Backup for {date_str}",
             )
+            # 9) すべて成功したときだけ完了マーカー（対象日・生成内容のハッシュ）を記録する
+            summary["marker_recorded"] = _record_autogen_done(storage, date_str, body, content)
+            if not summary["marker_recorded"]:
+                _autogen_log(f"{date_str}: 完了マーカーの記録を確認できませんでした")
             summary["ok"] = True
         except Exception as e:  # noqa: BLE001
             summary["error"] = str(e)
+            _autogen_log(f"{date_str}: 生成エラー（完了マーカーは記録しない）: {e}")
     return summary
 
 
@@ -2955,7 +3116,14 @@ for date_str in ordered_dates:
             memo_content = _carry_over_memo(get_vault_storage(vault_dir), d)
             body_with_memo = _append_memo_section(body_clean, memo_content)
             content = build_daily_file_content(body_with_memo, banner_value)
-            saved_path = write_daily_file_local(vault_dir, date_str, content)
+            try:
+                saved_path = write_daily_file_local(vault_dir, date_str, content)
+            except WriteConflict:
+                st.warning(
+                    f"⚠️ `{EXCLUDED_DIR_NAME}/{date_str}.md` は既に存在するため上書きしませんでした"
+                    "（編集内容の保護）。作り直す場合は Obsidian 側で既存ファイルを退避してから実行してください。"
+                )
+                continue  # この日付の後続処理（Inbox お掃除・FX・Push）は行わず次の日付の表示へ
             # 「## 単発」かつ [date::] を持つ該当タスクを Inbox から自動削除
             removed = cleanup_inbox_singles(vault_dir, [date_str])
             st.success(f"✅ `{saved_path}` を生成しました（banner: {banner_value}）。")
