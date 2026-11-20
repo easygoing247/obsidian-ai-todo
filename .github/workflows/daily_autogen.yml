@@ -6,7 +6,13 @@ name: Daily ToDo Autogen (JST 05:00)
 # JST 05:00 == UTC 20:00（前日）。GitHub Actions の cron は UTC 基準。
 on:
   schedule:
-    - cron: "0 20 * * *"   # 毎日 UTC 20:00 = JST 翌 05:00
+    # GitHub の schedule は混雑で数時間遅れる／まれに欠落するため、時刻をずらして複数登録する。
+    # 生成は冪等（生成済み・ファイル既存なら書かない）なので、複数回起動しても安全。
+    # 正時ちょうど（:00）は特に混み合うため、わざと分をずらしている。
+    - cron: "7 20 * * *"    # JST 05:07
+    - cron: "37 20 * * *"   # JST 05:37
+    - cron: "17 21 * * *"   # JST 06:17
+    - cron: "47 22 * * *"   # JST 07:47
   workflow_dispatch:        # 手動実行（テスト用）も可能にする
 
 # 生成物を push_to_github が REST API でコミットするためトークンを使う。
@@ -57,4 +63,5 @@ jobs:
 
       - name: Run headless daily generation
         run: |
-          python -c "from app import run_headless_generation; import json; print(json.dumps(run_headless_generation(), ensure_ascii=False, indent=2))"
+          # 失敗（生成エラー／GitHubバックアップ失敗）時は非ゼロ終了し、実行履歴を赤にして後から分かるようにする
+          python -c "import sys; from app import headless_job_main; sys.exit(headless_job_main())"

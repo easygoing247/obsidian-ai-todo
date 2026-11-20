@@ -1650,11 +1650,12 @@ def append_task_to_inbox(
 # ---------------------------------------------------------------------------
 # GitHub への保存（Create or Update）
 # ---------------------------------------------------------------------------
-def push_to_github(file_path: str, content: str, commit_message: str):
+def push_to_github(file_path: str, content: str, commit_message: str, skip_if_same: bool = False):
     """GitHub REST API で file_path にファイルをコミットする。
 
     既存ファイルがあれば sha を取得してから PUT で上書き、無ければ新規作成する。
     認証情報は st.secrets から取得する。
+    skip_if_same=True のときは、GitHub 上の内容が同一なら空コミットを増やさず成功扱いで返す。
     戻り値: (成功フラグ bool, メッセージ str)
     """
     token = get_secret("GITHUB_TOKEN")
@@ -1692,6 +1693,13 @@ def push_to_github(file_path: str, content: str, commit_message: str):
         )
         if get_res.status_code == 200:
             sha = get_res.json().get("sha")
+            if skip_if_same:
+                try:
+                    remote = base64.b64decode(get_res.json().get("content", "") or "").decode("utf-8")
+                except Exception:  # noqa: BLE001
+                    remote = None
+                if remote is not None and remote == content:
+                    return True, f"{file_path} は GitHub 上と同一のためコミットを省略しました。"
         elif get_res.status_code not in (404,):
             return False, (
                 f"既存ファイル確認でエラー (HTTP {get_res.status_code}): "
@@ -2417,6 +2425,19 @@ def run_headless_generation(vault_dir: str = None, target_date: date = None) -> 
                 summary.update(skipped=True, skip_reason=reason, ok=True,
                                saved_path=f"[{storage.kind}] {daily_rel}")
                 _autogen_log(f"{date_str}: スキップ: {reason}")
+                # 生成はスキップしても GitHub バックアップは行う（内容が同一なら省略される）。
+                # Dropbox 側へは一切書かない。失敗は summary["github"] と標準ログに残す。
+                if existing_text is not None:
+                    try:
+                        summary["github"] = push_to_github(
+                            file_path=daily_rel,
+                            content=existing_text,
+                            commit_message=f"auto: Backup Daily ToDo for {date_str}",
+                            skip_if_same=True,
+                        )
+                    except Exception as e:  # noqa: BLE001
+                        summary["github"] = (False, f"バックアップ中に例外: {e}")
+                    _autogen_log(f"{date_str}: スキップ時のGitHubバックアップ: {summary['github']}")
                 return summary
             # 1) キャッシュ強制バイパス: 毎回ストレージから最新の Vault を直接パース
             notes = storage.load_notes()
@@ -2461,6 +2482,7 @@ def run_headless_generation(vault_dir: str = None, target_date: date = None) -> 
                 content=content,
                 commit_message=f"auto: Generate Daily ToDo & Backup for {date_str}",
             )
+            _autogen_log(f"{date_str}: GitHubバックアップ: {summary['github']}")
             # 9) すべて成功したときだけ完了マーカー（対象日・生成内容のハッシュ）を記録する
             summary["marker_recorded"] = _record_autogen_done(storage, date_str, body, content)
             if not summary["marker_recorded"]:
@@ -2470,6 +2492,39 @@ def run_headless_generation(vault_dir: str = None, target_date: date = None) -> 
             summary["error"] = str(e)
             _autogen_log(f"{date_str}: 生成エラー（完了マーカーは記録しない）: {e}")
     return summary
+
+
+def run_headless_generation_with_retry(vault_dir: str = None, target_date: date = None,
+                                       max_attempts: int = 3, wait_sec: float = 60.0) -> dict:
+    """例外で失敗した場合のみ、待ってから再試行する（冪等なので再実行は安全）。"""
+    summary = run_headless_generation(vault_dir, target_date)
+    attempt = 1
+    while summary.get("error") and attempt < max_attempts:
+        _autogen_log(f"生成失敗のため {wait_sec:.0f} 秒後に再試行します（{attempt}/{max_attempts}）: {summary['error']}")
+        time.sleep(wait_sec)
+        attempt += 1
+        summary = run_headless_generation(vault_dir, target_date)
+    summary["attempts"] = attempt
+    return summary
+
+
+def headless_job_main() -> int:
+    """GitHub Actions 用エントリ。サマリを出力し、失敗があれば非ゼロで終了させて実行履歴を赤にする。"""
+    summary = run_headless_generation_with_retry()
+    print(json.dumps(summary, ensure_ascii=False, indent=2, default=str))
+    problems = []
+    if summary.get("error"):
+        problems.append(f"生成エラー: {summary['error']}")
+    elif not summary.get("ok"):
+        problems.append("生成が完了しませんでした（ok=False）")
+    elif not summary.get("skipped") and not summary.get("marker_recorded"):
+        problems.append("生成後の完了マーカーを記録できませんでした")
+    gh = summary.get("github")
+    if isinstance(gh, (list, tuple)) and gh and gh[0] is False:
+        problems.append(f"GitHubバックアップ失敗: {gh[1] if len(gh) > 1 else ''}")
+    for p in problems:
+        print(f"::error title=Daily ToDo Autogen::{p}")
+    return 1 if problems else 0
 
 
 # ---------------------------------------------------------------------------
@@ -2498,25 +2553,48 @@ class _DailyAutogenScheduler:
         nxt = datetime.now(JST) + timedelta(seconds=self._seconds_until_target())
         return nxt.strftime("%Y-%m-%d %H:%M")
 
+    RETRY_SEC = 600      # 失敗時の再試行間隔
+    MAX_ATTEMPTS = 6     # 1日あたりの最大試行回数
+
     def _loop(self):
+        """30秒ごとに実時計（JST）で判定するループ。
+
+        - 05:00 以降で当日分が未処理なら生成を試みる。スレッド起動が 05:00 より後
+          （Streamlit Cloud のスリープ復帰・再デプロイ直後など）でも、起動直後に即キャッチアップする。
+        - run_headless_generation は冪等（生成済み／ファイル既存なら書かない）なので、何度呼んでも安全。
+        - 例外で失敗したら RETRY_SEC 後に再試行し、MAX_ATTEMPTS で打ち切る。失敗はログと last_error に残す。
+        """
+        done_date = None
+        attempts_date = None
+        attempts = 0
+        retry_at = datetime.now(JST)
         while not self._stop.is_set():
-            # 目標時刻まで小刻みに待機（停止要求・時刻ずれに追随）
-            end = time.monotonic() + self._seconds_until_target()
-            while not self._stop.is_set():
-                remaining = end - time.monotonic()
-                if remaining <= 0:
-                    break
-                time.sleep(min(30.0, remaining))
-            if self._stop.is_set():
-                break
-            # 5:00 到達 → 当日分をキャッシュバイパスで自動生成＆Push
             try:
-                self.last_summary = run_headless_generation(self.vault_dir, today_jst())
-                self.last_error = None
+                now = datetime.now(JST)
+                today = now.date()
+                if attempts_date != today:
+                    attempts_date, attempts = today, 0
+                    retry_at = now
+                if now.hour >= self.hour and done_date != today and now >= retry_at:
+                    attempts += 1
+                    summary = run_headless_generation(self.vault_dir, today)
+                    self.last_summary = summary
+                    err = summary.get("error")
+                    if not err:
+                        self.last_error = None
+                        done_date = today
+                    else:
+                        self.last_error = err
+                        if attempts >= self.MAX_ATTEMPTS:
+                            _autogen_log(f"{today}: 常駐スケジューラ: {attempts}回失敗したため本日は打ち切り: {err}")
+                            done_date = today
+                        else:
+                            retry_at = now + timedelta(seconds=self.RETRY_SEC)
+                            _autogen_log(f"{today}: 常駐スケジューラ: 失敗（{attempts}回目）。{self.RETRY_SEC}秒後に再試行: {err}")
             except Exception as e:  # noqa: BLE001
                 self.last_error = str(e)
-            # 同一 05:00 の二重発火を防ぐため少し進めてから次周回
-            time.sleep(120)
+                _autogen_log(f"常駐スケジューラ内で例外（継続）: {e}")
+            self._stop.wait(30.0)
 
     def start(self):
         if self._thread and self._thread.is_alive():
